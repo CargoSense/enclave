@@ -114,9 +114,10 @@ mrb_basic_alloc_func(void *ptr, size_t size)
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    struct timespec deadline;
-    int             expired;
-    unsigned int    check_counter;
+    struct timespec  deadline;
+    int              expired;
+    unsigned int     check_counter;
+    const mrb_code  *last_raise_pc;  /* pc of the previous post-expiry re-raise */
 } timeout_state_t;
 
 /* ------------------------------------------------------------------ */
@@ -196,6 +197,11 @@ struct sandbox_state {
     size_t          memory_limit;      /* 0 = unlimited */
     mem_tracker_t   mem_tracker;
     timeout_state_t timeout_state;
+
+    /* Dedicated timeout exception class (Enclave::TimeoutError < Exception),
+     * (re)created by sandbox_setup_mrb. Cached so the code-fetch hook can raise
+     * it without a class lookup on every fetch. */
+    struct RClass  *timeout_err_class;
 };
 
 /* ------------------------------------------------------------------ */
@@ -212,14 +218,44 @@ sandbox_code_fetch_hook(struct mrb_state *mrb, const struct mrb_irep *irep,
     if (!state) return;
 
     timeout_state_t *ts = &state->timeout_state;
-    if (ts->expired) return; /* already raised, avoid re-entry */
 
-    /* Only check clock every N instructions */
+    /* Always non-NULL after sandbox_setup_mrb; fall back defensively. */
+    struct RClass *terr = state->timeout_err_class
+        ? state->timeout_err_class : mrb->eException_class;
+
+    /* Once the deadline has passed, re-raise on EVERY instruction fetch — not
+     * just the first time. mrb_raise longjmps into the nearest rescue/ensure
+     * handler, but because this hook fires again before that handler executes a
+     * single opcode, the handler makes no forward progress: the raise unwinds
+     * strictly outward through every handler and terminates the eval. This is
+     * what makes the timeout effectively uncatchable — it defeats
+     * `rescue Exception; retry; end` and nested variants that the old one-shot
+     * `if (ts->expired) return;` left wide open.
+     *
+     * The one exception is `ensure`: mruby compiles it with target == range end
+     * and an inclusive catch range, so a raise at the handler's own entry pc
+     * (its OP_EXCEPT) re-finds the same handler and jumps right back — an
+     * infinite raise/land livelock. Detect that (same pc as the previous
+     * re-raise) and let this single opcode execute so the VM advances past the
+     * handler entry; the next raise then lands outside the range and unwinds
+     * outward. This lets no user handler body run: only the VM's own exception-
+     * dispatch machinery gets the one opcode it needs to keep propagating. */
+    if (ts->expired) {
+        if (pc == ts->last_raise_pc) {
+            ts->last_raise_pc = NULL; /* allow exactly one opcode, then resume */
+            return;
+        }
+        ts->last_raise_pc = pc;
+        mrb_raise(mrb, terr, "execution timeout exceeded");
+        return; /* unreachable: mrb_raise does not return */
+    }
+
+    /* Only check the wall clock every N instructions to keep overhead low. */
     ts->check_counter++;
     if (ts->check_counter < TIMEOUT_CHECK_INTERVAL) return;
     ts->check_counter = 0;
 
-    /* Check if deadline is set (zero means no timeout) */
+    /* Deadline unset (zero) means no timeout. */
     if (ts->deadline.tv_sec == 0 && ts->deadline.tv_nsec == 0) return;
 
     struct timespec now;
@@ -228,7 +264,7 @@ sandbox_code_fetch_hook(struct mrb_state *mrb, const struct mrb_irep *irep,
     if (now.tv_sec > ts->deadline.tv_sec ||
         (now.tv_sec == ts->deadline.tv_sec && now.tv_nsec >= ts->deadline.tv_nsec)) {
         ts->expired = 1;
-        mrb_raise(mrb, mrb_class_get(mrb, "RuntimeError"), "execution timeout exceeded");
+        mrb_raise(mrb, terr, "execution timeout exceeded");
     }
 }
 
@@ -596,6 +632,19 @@ sandbox_mrb_p(mrb_state *mrb, mrb_value self)
 static void
 sandbox_setup_mrb(sandbox_state_t *state)
 {
+    /* Dedicated timeout class raised by the code-fetch hook. It descends from
+     * Exception (NOT StandardError), so a bare `rescue`/`rescue => e` in
+     * sandboxed code won't even name it; the re-raising hook then makes it
+     * uncatchable regardless of what the sandbox writes. Mirrors the host-side
+     * Enclave::TimeoutError. Recreated here because setup also runs after
+     * reset! against a fresh mrb_state. */
+    struct RClass *enclave_mod = mrb_define_module(state->mrb, "Enclave");
+    state->timeout_err_class = mrb_define_class_under(
+        state->mrb, enclave_mod, "TimeoutError", state->mrb->eException_class);
+    /* Pin it as a GC root so the cached pointer used by the code-fetch hook
+     * stays valid even if sandboxed code detaches the Enclave constant. */
+    mrb_gc_register(state->mrb, mrb_obj_value(state->timeout_err_class));
+
     /* Override Kernel#print, define Kernel#puts, override Kernel#p */
     struct RClass *kernel = state->mrb->kernel_module;
     mrb_define_method(state->mrb, kernel, "print", sandbox_mrb_print, MRB_ARGS_ANY());
@@ -702,6 +751,7 @@ sandbox_limits_begin(sandbox_state_t *state)
 
     state->timeout_state.expired = 0;
     state->timeout_state.check_counter = 0;
+    state->timeout_state.last_raise_pc = NULL;
     if (state->timeout_seconds > 0) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);

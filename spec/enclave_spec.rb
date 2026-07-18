@@ -629,6 +629,100 @@ RSpec.describe Enclave do
     end
   end
 
+  # H1: the wall-clock timeout must be uncatchable. Sandboxed code that rescues
+  # the timeout (even by its exact class), retries, or hides work in an ensure
+  # block must not be able to run past the deadline or wedge the worker.
+  #
+  # A wedged mruby VM holds the GVL, so an in-process Timeout can't interrupt a
+  # regression — it would hang the whole suite. Each attempt therefore runs in a
+  # forked child under a hard wall-clock ceiling enforced with SIGKILL; a
+  # regression surfaces as :wedged or :completed (a failing assertion), never a
+  # hang.
+  describe "timeout cannot be escaped by sandboxed code (H1)" do
+    # Returns :timeout when the enclave stopped the code at the deadline,
+    # :completed if the code ran to completion (timeout defeated), or :wedged if
+    # the eval never returned within `kill_after` (timeout defeated, worker hung).
+    def eval_isolated(code, timeout: 0.5, kill_after: 4.0)
+      reader, writer = IO.pipe
+      pid = fork do
+        reader.close
+        outcome =
+          begin
+            e = described_class.new(timeout: timeout, memory_limit: 200_000_000)
+            r = e.eval(code)
+            e.close
+            r.error.nil? ? "completed" : "error"
+          rescue Enclave::TimeoutError
+            "timeout"
+          rescue Exception # rubocop:disable Lint/RescueException
+            "host_error"
+          end
+        writer.write(outcome)
+        writer.close
+        exit!(0)
+      end
+      writer.close
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + kill_after
+      until Process.waitpid(pid, Process::WNOHANG)
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          Process.kill("KILL", pid)
+          Process.waitpid(pid)
+          reader.close
+          return :wedged
+        end
+        sleep 0.01
+      end
+      out = reader.read
+      reader.close
+      out.empty? ? :wedged : out.to_sym
+    end
+
+    before { skip "fork not available on this platform" unless Process.respond_to?(:fork) }
+
+    # Bounded busy-work that runs well past a 0.5s deadline if it ever executes.
+    work = "n = 0; 50_000_000.times { n += 1 }; n"
+
+    it "cannot be swallowed by `rescue Exception`" do
+      expect(eval_isolated("begin\n loop {}\nrescue Exception\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be swallowed by a bare `rescue`" do
+      expect(eval_isolated("begin\n loop {}\nrescue\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be caught by its own class name" do
+      expect(eval_isolated("begin\n loop {}\nrescue Enclave::TimeoutError\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by `rescue => e; retry; end`" do
+      expect(eval_isolated("begin\n loop {}\nrescue Exception\n retry\nend")).to eq(:timeout)
+    end
+
+    it "cannot be outrun by work hidden in an `ensure`" do
+      expect(eval_isolated("begin\n loop {}\nensure\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by an infinite `ensure` loop" do
+      expect(eval_isolated("begin\n loop {}\nensure\n loop {}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by a retry nested inside an ensure" do
+      expect(eval_isolated("begin\n loop {}\nensure\n begin\n loop {}\n rescue Exception\n retry\n end\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by re-raising inside the handler" do
+      expect(eval_isolated("begin\n loop {}\nrescue Exception\n raise 'again' while true\nend")).to eq(:timeout)
+    end
+
+    it "still stops a plain infinite loop (control)" do
+      expect(eval_isolated("loop {}")).to eq(:timeout)
+    end
+
+    it "still lets fast code finish normally (control)" do
+      expect(eval_isolated("1 + 1", timeout: 5)).to eq(:completed)
+    end
+  end
+
   describe "memory_limit" do
     it "raises MemoryLimitError on string bomb" do
       e = described_class.new(memory_limit: 1_000_000)
