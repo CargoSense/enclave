@@ -6,6 +6,7 @@
  */
 
 #include <ruby.h>
+#include <stdlib.h>
 #include "sandbox_core.h"
 
 /* Error class statics */
@@ -298,6 +299,26 @@ enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb
     if (!sb->state) {
         rb_raise(rb_eRuntimeError, "failed to initialize mruby enclave");
     }
+
+    /* H7: memory_limit is enforced only if our mrb_basic_alloc_func override
+     * intercepts mruby's allocations (a link-order property). Building the VM
+     * just allocated tens of KB through the tracker, so zero tracked bytes means
+     * the override is inactive and the limit would silently not enforce. Fail
+     * closed rather than run a memory limit that does nothing. */
+    {
+        size_t tracked = sandbox_state_tracked_bytes(sb->state);
+        if (getenv("ENCLAVE_SELFTEST_UNTRACKED")) tracked = 0; /* test seam: simulate the regression */
+        if (memory_limit > 0 && tracked == 0) {
+            sandbox_state_free(sb->state);
+            sb->state = NULL;
+            rb_raise(rb_eRuntimeError,
+                     "enclave: memory_limit was set but the allocator override is inactive, "
+                     "so the limit would not be enforced (build/link regression: "
+                     "mrb_basic_alloc_func override lost). Refusing to run with limits "
+                     "silently disabled.");
+        }
+    }
+
     sb->closed = 0;
 
     /* Set up the callback so CRuby can handle tool calls */

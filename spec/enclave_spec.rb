@@ -1173,6 +1173,47 @@ RSpec.describe Enclave do
     end
   end
 
+  # H7: memory_limit works only because our allocator override intercepts mruby
+  # allocations via link order. If that breaks, the limit silently stops
+  # enforcing. A startup self-check fails closed instead. The test seam
+  # ENCLAVE_SELFTEST_UNTRACKED simulates the regression.
+  describe "memory-tracking self-check (H7)" do
+    around do |example|
+      original = ENV["ENCLAVE_SELFTEST_UNTRACKED"]
+      example.run
+    ensure
+      if original.nil? then ENV.delete("ENCLAVE_SELFTEST_UNTRACKED")
+      else ENV["ENCLAVE_SELFTEST_UNTRACKED"] = original
+      end
+    end
+
+    it "constructs normally with a memory_limit (tracking is active)" do
+      e = described_class.new(memory_limit: 1_000_000)
+      expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "fails closed if the allocator override is inactive and a limit is set" do
+      ENV["ENCLAVE_SELFTEST_UNTRACKED"] = "1"
+      expect { described_class.new(memory_limit: 1_000_000) }
+        .to raise_error(RuntimeError, /allocator override is inactive|silently disabled/)
+    end
+
+    it "does NOT fail when no memory_limit is requested (nothing to enforce)" do
+      ENV["ENCLAVE_SELFTEST_UNTRACKED"] = "1"
+      e = nil
+      expect { e = described_class.new }.not_to raise_error
+      e&.close
+    end
+
+    it "does NOT fail when memory_limit is explicitly nil" do
+      ENV["ENCLAVE_SELFTEST_UNTRACKED"] = "1"
+      e = nil
+      expect { e = described_class.new(memory_limit: nil) }.not_to raise_error
+      e&.close
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError

@@ -786,6 +786,12 @@ sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
     return state;
 }
 
+size_t
+sandbox_state_tracked_bytes(const sandbox_state_t *state)
+{
+    return state ? state->mem_tracker.current : 0;
+}
+
 void
 sandbox_state_free(sandbox_state_t *state)
 {

@@ -90,6 +90,12 @@ int sandbox_state_define_function(sandbox_state_t *state, const char *name);
 
 sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
                                    int max_tool_calls, double max_tool_seconds);
+
+/* Bytes currently tracked by the memory limiter. Nonzero right after
+ * construction confirms our mrb_basic_alloc_func override is intercepting
+ * mruby's allocations; zero means the link-order override is inactive and
+ * memory_limit cannot be enforced. */
+size_t sandbox_state_tracked_bytes(const sandbox_state_t *state);
 void             sandbox_state_free(sandbox_state_t *state);
 sandbox_result_t sandbox_state_eval(sandbox_state_t *state, const char *code);
 void             sandbox_state_reset(sandbox_state_t *state);
