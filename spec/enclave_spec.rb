@@ -1096,6 +1096,49 @@ RSpec.describe Enclave do
       expect(e.exposed_functions).not_to include(:injected)
       e.close
     end
+
+    context "self-declared surface (enclave_tool_methods)" do
+      # A tool that keeps a host-management method public but declares only its
+      # sandbox-facing methods as the exposable surface.
+      let(:declaring_tool) do
+        Class.new do
+          def run(x); "ran #{x}"; end
+          def status; "ok"; end
+          def reset!; :reset; end                 # host-facing; must never reach the sandbox
+          private def enclave_tool_methods; %i[run status]; end
+        end.new
+      end
+
+      it "exposes only the declared methods, not other publics" do
+        e = described_class.new
+        e.expose(declaring_tool)
+        expect(e.exposed_functions).to match_array(%i[run status])
+        expect(e.eval("reset!").error?).to be true
+        expect(e.eval('run("go")').value).to eq('"ran go"')
+        e.close
+      end
+
+      it "treats the declaration as a hard ceiling — except: can't widen it" do
+        e = described_class.new
+        e.expose(declaring_tool, except: %i[status])
+        expect(e.exposed_functions).to match_array(%i[run])
+        expect(e.eval("reset!").error?).to be true
+        e.close
+      end
+
+      it "refuses only: names outside the declared surface" do
+        e = described_class.new
+        expect { e.expose(declaring_tool, only: %i[reset!]) }.to raise_error(ArgumentError, /reset!/)
+        e.close
+      end
+
+      it "the declaring method itself is not exposed" do
+        e = described_class.new
+        e.expose(declaring_tool)
+        expect(e.exposed_functions).not_to include(:enclave_tool_methods)
+        e.close
+      end
+    end
   end
 
   # H6: a tool method's exception message crosses back into the sandbox verbatim,

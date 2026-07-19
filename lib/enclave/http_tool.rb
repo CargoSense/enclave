@@ -61,7 +61,7 @@ class Enclave
     def initialize(allow:, max_requests: 20, request_timeout: 5,
                    total_time_budget: 15, max_response_bytes: 1_000_000,
                    allowed_ports: [80, 443], on_request: nil, transport: nil)
-      @allow_any = (allow == :any)
+      @allow_any = (allow == :any || allow == ["ANY"]) # ["ANY"] accepted for host-policy compatibility
       @patterns = @allow_any ? [] : Array(allow).map { |domain| normalize_pattern(domain) }
       @max_requests = max_requests
       @total_time_budget = total_time_budget
@@ -99,11 +99,23 @@ class Enclave
     def put(url, body = nil, headers = {})   = request("PUT", url, headers, body)
     def patch(url, body = nil, headers = {}) = request("PATCH", url, headers, body)
 
-    private
-
+    # Reset the per-tool request/time budget. HOST-facing: call it between units
+    # of work when reusing one tool. Public, but never reachable from the sandbox
+    # (see enclave_tool_methods) — otherwise sandboxed code could wipe its own
+    # budget and make unlimited requests.
     def reset_budget!
       @requests = 0
       @started_at = nil
+      self
+    end
+
+    private
+
+    # The exact set of methods Enclave#expose may publish to the sandbox — the
+    # HTTP verbs only. Keeps host-management methods (reset_budget!) callable but
+    # out of reach of untrusted code.
+    def enclave_tool_methods
+      %i[request get head delete post put patch]
     end
 
     def deny!(reason)

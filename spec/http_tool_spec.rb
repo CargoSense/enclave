@@ -82,6 +82,22 @@ RSpec.describe Enclave::HttpTool do
       expect { tool(allow: :any, resolve_to: ["10.0.0.1"]).get("https://anything.example.org/") }
         .to raise_error(Denied, /private/)
     end
+
+    it 'accepts the ["ANY"] sentinel as an alias for :any (host-policy compat)' do
+      expect(tool(allow: ["ANY"]).get("https://anything.example.org/")["status"]).to eq(200)
+      expect { tool(allow: ["ANY"], resolve_to: ["169.254.169.254"]).get("https://x.example.org/") }
+        .to raise_error(Denied, /private/)
+    end
+  end
+
+  describe "reset_budget!" do
+    it "is public and resets the per-tool request budget for host reuse" do
+      t = described_class.new(allow: %w[api.example.com], max_requests: 2, transport: FakeTransport.new)
+      2.times { t.get("https://api.example.com/") }
+      expect { t.get("https://api.example.com/") }.to raise_error(Denied, /request budget/)
+      t.reset_budget!
+      expect(t.get("https://api.example.com/")["status"]).to eq(200)
+    end
   end
 
   describe "header rules" do
@@ -175,9 +191,17 @@ RSpec.describe Enclave::HttpTool do
       expect(enclave.eval('get("https://api.example.com/x")["status"]').value).to eq("200")
     end
 
-    it "does not let sandboxed code reach reset_budget!" do
-      enclave.expose(described_class.new(allow: %w[api.example.com], transport: FakeTransport.new))
-      expect(enclave.eval("reset_budget!").error?).to be true
+    it "does not let sandboxed code reach reset_budget! though it is public to the host" do
+      http = described_class.new(allow: %w[api.example.com], transport: FakeTransport.new)
+      expect(http.respond_to?(:reset_budget!)).to be true # host can call it directly
+      enclave.expose(http)
+      expect(enclave.exposed_functions).not_to include(:reset_budget!)
+      expect(enclave.eval("reset_budget!").error?).to be true # but the sandbox cannot
+    end
+
+    it "refuses to expose reset_budget! even under an explicit only:" do
+      http = described_class.new(allow: %w[api.example.com], transport: FakeTransport.new)
+      expect { enclave.expose(http, only: %i[reset_budget!]) }.to raise_error(ArgumentError)
     end
 
     it "surfaces a denial to sandboxed code as an error" do
