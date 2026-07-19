@@ -19,7 +19,9 @@ typedef enum {
     SANDBOX_ERROR_NONE,
     SANDBOX_ERROR_RUNTIME,
     SANDBOX_ERROR_TIMEOUT,
-    SANDBOX_ERROR_MEMORY_LIMIT
+    SANDBOX_ERROR_MEMORY_LIMIT,
+    SANDBOX_ERROR_TOOL_BUDGET,
+    SANDBOX_ERROR_INSTRUCTION_LIMIT
 } sandbox_error_kind_t;
 
 /* Result from an eval */
@@ -87,7 +89,15 @@ int sandbox_state_define_function(sandbox_state_t *state, const char *name);
 /* Core API                                                            */
 /* ------------------------------------------------------------------ */
 
-sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit);
+sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
+                                   int max_tool_calls, double max_tool_seconds,
+                                   uint64_t max_instructions);
+
+/* Bytes currently tracked by the memory limiter. Nonzero right after
+ * construction confirms our mrb_basic_alloc_func override is intercepting
+ * mruby's allocations; zero means the link-order override is inactive and
+ * memory_limit cannot be enforced. */
+size_t sandbox_state_tracked_bytes(const sandbox_state_t *state);
 void             sandbox_state_free(sandbox_state_t *state);
 sandbox_result_t sandbox_state_eval(sandbox_state_t *state, const char *code);
 void             sandbox_state_reset(sandbox_state_t *state);

@@ -135,7 +135,8 @@ RSpec.describe Enclave do
     # nothing dangerous runs in the host process.
 
     describe "missing dangerous classes" do
-      %w[File IO Dir Socket Process Signal ENV ARGV STDIN STDOUT STDERR].each do |const|
+      %w[File IO Dir Socket Process Signal ENV ARGV STDIN STDOUT STDERR
+         Regexp MatchData].each do |const|
         it "has no #{const}" do
           result = enclave.eval(const)
           expect(result.error?).to be true
@@ -629,6 +630,100 @@ RSpec.describe Enclave do
     end
   end
 
+  # H1: the wall-clock timeout must be uncatchable. Sandboxed code that rescues
+  # the timeout (even by its exact class), retries, or hides work in an ensure
+  # block must not be able to run past the deadline or wedge the worker.
+  #
+  # A wedged mruby VM holds the GVL, so an in-process Timeout can't interrupt a
+  # regression — it would hang the whole suite. Each attempt therefore runs in a
+  # forked child under a hard wall-clock ceiling enforced with SIGKILL; a
+  # regression surfaces as :wedged or :completed (a failing assertion), never a
+  # hang.
+  describe "timeout cannot be escaped by sandboxed code (H1)" do
+    # Returns :timeout when the enclave stopped the code at the deadline,
+    # :completed if the code ran to completion (timeout defeated), or :wedged if
+    # the eval never returned within `kill_after` (timeout defeated, worker hung).
+    def eval_isolated(code, timeout: 0.5, kill_after: 4.0)
+      reader, writer = IO.pipe
+      pid = fork do
+        reader.close
+        outcome =
+          begin
+            e = described_class.new(timeout: timeout, memory_limit: 200_000_000)
+            r = e.eval(code)
+            e.close
+            r.error.nil? ? "completed" : "error"
+          rescue Enclave::TimeoutError
+            "timeout"
+          rescue Exception # rubocop:disable Lint/RescueException
+            "host_error"
+          end
+        writer.write(outcome)
+        writer.close
+        exit!(0)
+      end
+      writer.close
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + kill_after
+      until Process.waitpid(pid, Process::WNOHANG)
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          Process.kill("KILL", pid)
+          Process.waitpid(pid)
+          reader.close
+          return :wedged
+        end
+        sleep 0.01
+      end
+      out = reader.read
+      reader.close
+      out.empty? ? :wedged : out.to_sym
+    end
+
+    before { skip "fork not available on this platform" unless Process.respond_to?(:fork) }
+
+    # Bounded busy-work that runs well past a 0.5s deadline if it ever executes.
+    work = "n = 0; 50_000_000.times { n += 1 }; n"
+
+    it "cannot be swallowed by `rescue Exception`" do
+      expect(eval_isolated("begin\n loop {}\nrescue Exception\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be swallowed by a bare `rescue`" do
+      expect(eval_isolated("begin\n loop {}\nrescue\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be caught by its own class name" do
+      expect(eval_isolated("begin\n loop {}\nrescue Enclave::TimeoutError\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by `rescue => e; retry; end`" do
+      expect(eval_isolated("begin\n loop {}\nrescue Exception\n retry\nend")).to eq(:timeout)
+    end
+
+    it "cannot be outrun by work hidden in an `ensure`" do
+      expect(eval_isolated("begin\n loop {}\nensure\n #{work}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by an infinite `ensure` loop" do
+      expect(eval_isolated("begin\n loop {}\nensure\n loop {}\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by a retry nested inside an ensure" do
+      expect(eval_isolated("begin\n loop {}\nensure\n begin\n loop {}\n rescue Exception\n retry\n end\nend")).to eq(:timeout)
+    end
+
+    it "cannot be defeated by re-raising inside the handler" do
+      expect(eval_isolated("begin\n loop {}\nrescue Exception\n raise 'again' while true\nend")).to eq(:timeout)
+    end
+
+    it "still stops a plain infinite loop (control)" do
+      expect(eval_isolated("loop {}")).to eq(:timeout)
+    end
+
+    it "still lets fast code finish normally (control)" do
+      expect(eval_isolated("1 + 1", timeout: 5)).to eq(:completed)
+    end
+  end
+
   describe "memory_limit" do
     it "raises MemoryLimitError on string bomb" do
       e = described_class.new(memory_limit: 1_000_000)
@@ -687,6 +782,540 @@ RSpec.describe Enclave do
     end
   end
 
+  # H2: the captured output buffer lives in raw host memory and is not counted
+  # by memory_limit, so without its own cap a print loop is a direct host-OOM.
+  describe "max_output_bytes (H2)" do
+    it "caps captured output at the configured size" do
+      e = described_class.new(max_output_bytes: 50_000)
+      result = e.eval('100_000.times { print "x" }; "done"')
+      expect(result.output.bytesize).to be <= 50_100 # cap + short marker
+      e.close
+    end
+
+    it "still returns the value and no error when output is truncated" do
+      e = described_class.new(max_output_bytes: 10_000)
+      result = e.eval('100_000.times { print "x" }; 42')
+      expect(result.error?).to be false
+      expect(result.value).to eq("42")
+      e.close
+    end
+
+    it "appends a truncation marker when the cap is exceeded" do
+      e = described_class.new(max_output_bytes: 10_000)
+      result = e.eval('print "x" * 20_000')
+      expect(result.output).to include("truncated")
+      e.close
+    end
+
+    it "does NOT truncate or mark output that fits under the cap" do
+      e = described_class.new(max_output_bytes: 10_000)
+      result = e.eval('print "x" * 100')
+      expect(result.output.bytesize).to eq(100)
+      expect(result.output).not_to include("truncated")
+      e.close
+    end
+
+    it "keeps exactly the first max_output_bytes and drops the rest" do
+      e = described_class.new(max_output_bytes: 100)
+      result = e.eval('print("A" * 100); print("B" * 100)')
+      expect(result.output[0, 100]).to eq("A" * 100)
+      expect(result.output).not_to include("B")
+      e.close
+    end
+
+    it "treats 0 as unlimited (opt out)" do
+      e = described_class.new(max_output_bytes: 0)
+      result = e.eval('20_000.times { print "y" * 100 }; "done"') # ~2 MB
+      expect(result.output.bytesize).to eq(2_000_000)
+      expect(result.output).not_to include("truncated")
+      e.close
+    end
+
+    it "is enforced by a safe non-nil default" do
+      expect(Enclave.max_output_bytes).to be_a(Integer)
+      expect(Enclave.max_output_bytes).to be > 0
+      e = described_class.new
+      expect(e.max_output_bytes).to eq(Enclave.max_output_bytes)
+      e.close
+    end
+
+    it "survives reset!" do
+      e = described_class.new(max_output_bytes: 1_000)
+      e.eval('print "x" * 5_000')
+      e.reset!
+      result = e.eval('print "z" * 5_000')
+      expect(result.output.bytesize).to be <= 1_100
+      expect(result.output).to include("truncated")
+      e.close
+    end
+
+    it "applies class-level default" do
+      begin
+        Enclave.max_output_bytes = 5_000
+        e = described_class.new
+        result = e.eval('print "x" * 20_000')
+        expect(result.output.bytesize).to be <= 5_100
+        e.close
+      ensure
+        Enclave.max_output_bytes = Enclave::DEFAULT_MAX_OUTPUT_BYTES
+      end
+    end
+
+    it "per-instance override beats the class-level default" do
+      e = described_class.new(max_output_bytes: 200)
+      result = e.eval('print "x" * 20_000')
+      expect(result.output.bytesize).to be <= 300
+      e.close
+    end
+  end
+
+  # H3: the timeout (code_fetch_hook) fires only at bytecode-fetch boundaries, so
+  # a single long-running C builtin can't be preempted. Allocation-heavy builtins
+  # are bounded by memory_limit, but a pure-CPU one — a catastrophic-backtracking
+  # Regexp — is unbounded (ReDoS). The build therefore ships without Regexp; these
+  # are the runtime backstop for the build-time denylist guard.
+  describe "no unpreemptable regex builtin (H3)" do
+    it "does not define Regexp" do
+      expect(enclave.eval("Regexp").error?).to be true
+    end
+
+    it "does not define MatchData" do
+      expect(enclave.eval("MatchData").error?).to be true
+    end
+
+    it "rejects a regex literal (no Regexp to construct)" do
+      result = enclave.eval('/(a+)+$/')
+      expect(result.error?).to be true
+    end
+
+    it "rejects =~ against a regex" do
+      result = enclave.eval('"aaaa" =~ /a+/')
+      expect(result.error?).to be true
+    end
+
+    it "rejects String#match" do
+      result = enclave.eval('"aaaa".match(/a+/)')
+      expect(result.error?).to be true
+    end
+
+    # Allocation-heavy builtins that COULD run long are instead bounded (they
+    # raise before doing real work), so the absence of Regexp closes the gap.
+    it "bounds a huge String#* by memory_limit" do
+      e = described_class.new(timeout: 5, memory_limit: 20_000_000)
+      expect { e.eval('"x" * 500_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "caps oversized Array allocation" do
+      result = enclave.eval("Array.new(500_000_000, 0)")
+      expect(result.error?).to be true
+    end
+
+    it "caps oversized bignum exponentiation" do
+      result = enclave.eval("10 ** 100_000_000")
+      expect(result.error?).to be true
+    end
+  end
+
+  # H4: the timeout counts only mruby execution, never time inside host tool
+  # methods, so a sandbox could pin a worker with unbounded tool calls. Provide a
+  # per-eval budget (count + cumulative wall-clock) plus before/after hooks.
+  describe "tool-call budget and hooks (H4)" do
+    # Tool object whose calls we observe through a closure, so no extra methods
+    # leak into the sandbox. `slow` sleeps to exercise the wall-clock budget.
+    def build_tool(calls)
+      tool = Object.new
+      tool.define_singleton_method(:touch) { |*a| calls << a; "ok" }
+      tool.define_singleton_method(:slow)  { |*_a| calls << :slow; sleep 0.1; "s" }
+      tool
+    end
+
+    it "caps the number of tool calls per eval" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), max_tool_calls: 3, timeout: 5)
+      expect { e.eval("10.times { touch }") }.to raise_error(Enclave::ToolBudgetError)
+      expect(calls.size).to eq(3)
+      e.close
+    end
+
+    it "resets the call budget each eval" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), max_tool_calls: 2, timeout: 5)
+      2.times { e.eval("5.times { touch }") rescue nil }
+      expect(calls.size).to eq(4)
+      e.close
+    end
+
+    it "is unlimited by default" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), timeout: 5)
+      e.eval("20.times { touch }")
+      expect(calls.size).to eq(20)
+      e.close
+    end
+
+    it "bounds cumulative tool wall-clock with max_tool_seconds" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), max_tool_seconds: 0.25, timeout: 30)
+      expect { e.eval("100.times { slow }") }.to raise_error(Enclave::ToolBudgetError)
+      expect(calls.size).to be_between(1, 6) # a few 0.1s calls, nowhere near 100
+      e.close
+    end
+
+    it "ToolBudgetError is an Enclave::Error" do
+      expect(Enclave::ToolBudgetError).to be < Enclave::Error
+    end
+
+    it "runs before_tool_call with (name, args)" do
+      seen = []
+      e = described_class.new(tools: build_tool([]), timeout: 5,
+                              before_tool_call: ->(name, args) { seen << [name, args] })
+      e.eval("touch(1, 2)")
+      expect(seen).to eq([[:touch, [1, 2]]])
+      e.close
+    end
+
+    it "runs after_tool_call with (name, args, result)" do
+      seen = []
+      e = described_class.new(tools: build_tool([]), timeout: 5,
+                              after_tool_call: ->(name, args, result) { seen << [name, args, result] })
+      e.eval("touch(7)")
+      expect(seen).to eq([[:touch, [7], "ok"]])
+      e.close
+    end
+
+    it "lets before_tool_call veto a call by raising" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), timeout: 5,
+                              before_tool_call: ->(_name, _args) { raise "denied" })
+      result = e.eval("touch")
+      expect(calls).to be_empty
+      expect(result.error?).to be true
+      expect(result.error).to include("denied")
+      e.close
+    end
+
+    it "works with no hooks set (default)" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), timeout: 5)
+      result = e.eval("touch")
+      expect(result.error?).to be false
+      expect(calls.size).to eq(1)
+      e.close
+    end
+
+    it "exposes the budget via attr_readers" do
+      e = described_class.new(max_tool_calls: 9, max_tool_seconds: 1.5)
+      expect(e.max_tool_calls).to eq(9)
+      expect(e.max_tool_seconds).to eq(1.5)
+      e.close
+    end
+  end
+
+  # H5: expose publishes ALL public methods, so a helper you forget to make
+  # private is silently reachable by untrusted code. Provide explicit surface
+  # control (only:/except:) and make the surface visible/assertable.
+  describe "expose surface control (H5)" do
+    let(:service) do
+      Class.new do
+        def search(q); "results for #{q}"; end
+        def fetch(id); "item #{id}"; end
+        def internal_secret; "SECRET"; end # forgot to make private
+      end.new
+    end
+
+    module H5Kit
+      def a; 1; end
+      def b; 2; end
+      def c; 3; end
+    end
+
+    it "still exposes every public method by default (backward compatible)" do
+      e = described_class.new(tools: service)
+      expect(e.exposed_functions).to match_array(%i[search fetch internal_secret])
+      expect(e.eval("internal_secret").value).to eq('"SECRET"')
+      e.close
+    end
+
+    it "only: exposes exactly the allowlist" do
+      e = described_class.new
+      e.expose(service, only: %i[search fetch])
+      expect(e.exposed_functions).to match_array(%i[search fetch])
+      expect(e.eval("search('x')").value).to eq('"results for x"')
+      e.close
+    end
+
+    it "only: leaves other methods unreachable from the sandbox" do
+      e = described_class.new
+      e.expose(service, only: %i[search])
+      expect(e.eval("internal_secret").error?).to be true
+      e.close
+    end
+
+    it "except: hides the denylisted method" do
+      e = described_class.new
+      e.expose(service, except: %i[internal_secret])
+      expect(e.exposed_functions).to match_array(%i[search fetch])
+      expect(e.eval("internal_secret").error?).to be true
+      e.close
+    end
+
+    it "raises if both only: and except: are given" do
+      e = described_class.new
+      expect { e.expose(service, only: %i[search], except: %i[fetch]) }.to raise_error(ArgumentError)
+      e.close
+    end
+
+    it "raises on an unknown only: name (misnamed allowlist)" do
+      e = described_class.new
+      expect { e.expose(service, only: %i[serch]) }.to raise_error(ArgumentError, /serch/)
+      e.close
+    end
+
+    it "raises on an unknown except: name (typo must not silently expose)" do
+      e = described_class.new
+      expect { e.expose(service, except: %i[internal_secrett]) }.to raise_error(ArgumentError, /internal_secrett/)
+      e.close
+    end
+
+    it "honors only: for module tools" do
+      e = described_class.new
+      e.expose(H5Kit, only: %i[a b])
+      expect(e.exposed_functions).to match_array(%i[a b])
+      expect(e.eval("a + b").value).to eq("3")
+      expect(e.eval("c").error?).to be true
+      e.close
+    end
+
+    it "accumulates exposed_functions across calls and returns a copy" do
+      e = described_class.new
+      e.expose(service, only: %i[search])
+      e.expose(H5Kit, only: %i[a])
+      expect(e.exposed_functions).to match_array(%i[search a])
+      e.exposed_functions << :injected
+      expect(e.exposed_functions).not_to include(:injected)
+      e.close
+    end
+  end
+
+  # H6: a tool method's exception message crosses back into the sandbox verbatim,
+  # leaking host internals. Provide an optional sanitizer to redact it.
+  describe "tool-error sanitization (H6)" do
+    secret = "SELECT * FROM users WHERE ssn='123-45-6789'"
+
+    let(:tools) do
+      s = secret
+      Class.new do
+        define_method(:boom) { raise ArgumentError, s }
+        def ok; "fine"; end
+      end.new
+    end
+
+    # Read the message the sandbox sees for a failing tool call.
+    def sandboxed_message(enclave)
+      enclave.eval("begin; boom; rescue => ex; ex.message; end").value
+    end
+
+    it "leaks the full message by default (no sanitizer)" do
+      e = described_class.new(tools: tools, timeout: 5)
+      expect(sandboxed_message(e)).to include("ssn=")
+      e.close
+    end
+
+    it "redacts the message when a sanitizer is set" do
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(name, _exc) { "#{name} failed" })
+      msg = sandboxed_message(e)
+      expect(msg).not_to include("ssn=")
+      expect(msg).to include("boom failed")
+      e.close
+    end
+
+    it "passes the tool name and original exception to the sanitizer" do
+      seen = nil
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(name, exc) { seen = [name, exc.class, exc.message]; "x" })
+      sandboxed_message(e)
+      expect(seen[0]).to eq(:boom)
+      expect(seen[1]).to eq(ArgumentError)
+      expect(seen[2]).to include("ssn=") # host still gets the full error to log
+      e.close
+    end
+
+    it "does not touch successful tool calls" do
+      e = described_class.new(tools: tools, timeout: 5, error_sanitizer: ->(_n, _e) { "x" })
+      expect(e.eval("ok").value).to eq('"fine"')
+      e.close
+    end
+
+    it "does not sanitize a before_tool_call veto (integrator-owned message)" do
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(_n, _e) { "redacted" },
+                              before_tool_call: ->(_n, _a) { raise "rate limited" })
+      msg = e.eval("begin; ok; rescue => ex; ex.message; end").value
+      expect(msg).to include("rate limited")
+      e.close
+    end
+
+    it "falls back to a generic message if the sanitizer itself raises" do
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(_n, _e) { raise "bug: #{secret}" })
+      msg = sandboxed_message(e)
+      expect(msg).not_to include("ssn=")
+      expect(msg).to include("tool call failed")
+      e.close
+    end
+
+    it "falls back to a generic message if the sanitizer returns nil" do
+      e = described_class.new(tools: tools, timeout: 5, error_sanitizer: ->(_n, _e) { nil })
+      expect(sandboxed_message(e)).to include("tool call failed")
+      e.close
+    end
+  end
+
+  # H7: memory_limit works only because our allocator override intercepts mruby
+  # allocations via link order. If that breaks, the limit silently stops
+  # enforcing. A startup self-check fails closed instead. The test seam
+  # ENCLAVE_SELFTEST_UNTRACKED simulates the regression.
+  describe "memory-tracking self-check (H7)" do
+    around do |example|
+      original = ENV["ENCLAVE_SELFTEST_UNTRACKED"]
+      example.run
+    ensure
+      if original.nil? then ENV.delete("ENCLAVE_SELFTEST_UNTRACKED")
+      else ENV["ENCLAVE_SELFTEST_UNTRACKED"] = original
+      end
+    end
+
+    it "constructs normally with a memory_limit (tracking is active)" do
+      e = described_class.new(memory_limit: 1_000_000)
+      expect { e.eval('"x" * 10_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "fails closed if the allocator override is inactive and a limit is set" do
+      ENV["ENCLAVE_SELFTEST_UNTRACKED"] = "1"
+      expect { described_class.new(memory_limit: 1_000_000) }
+        .to raise_error(RuntimeError, /allocator override is inactive|silently disabled/)
+    end
+
+    it "does NOT fail when no memory_limit is requested (nothing to enforce)" do
+      ENV["ENCLAVE_SELFTEST_UNTRACKED"] = "1"
+      e = nil
+      expect { e = described_class.new }.not_to raise_error
+      e&.close
+    end
+
+    it "does NOT fail when memory_limit is explicitly nil" do
+      ENV["ENCLAVE_SELFTEST_UNTRACKED"] = "1"
+      e = nil
+      expect { e = described_class.new(memory_limit: nil) }.not_to raise_error
+      e&.close
+    end
+  end
+
+  # H1 (deferred): a deterministic instruction "fuel" budget alongside the
+  # wall-clock timeout — bounds CPU independent of host load, and is uncatchable
+  # the same way the timeout is.
+  describe "max_instructions fuel budget (H1)" do
+    it "raises InstructionLimitError when the budget is exhausted" do
+      e = described_class.new(max_instructions: 100_000)
+      expect { e.eval("i = 0; while true; i += 1; end") }.to raise_error(Enclave::InstructionLimitError)
+      e.close
+    end
+
+    it "is deterministic — the same code hits the same hard boundary" do
+      code = "n = 0; 1000.times { n += 1 }; n"
+      needed = (1..50_000).bsearch do |fuel|
+        e = described_class.new(max_instructions: fuel)
+        ok = begin; e.eval(code); true; rescue Enclave::InstructionLimitError; false; end
+        e.close
+        ok
+      end
+      expect(needed).to be_a(Integer)
+      # one below always fails, at-threshold always succeeds, across runs
+      3.times do
+        below = described_class.new(max_instructions: needed - 1)
+        expect { below.eval(code) }.to raise_error(Enclave::InstructionLimitError)
+        below.close
+        at = described_class.new(max_instructions: needed)
+        expect(at.eval(code).error?).to be false
+        at.close
+      end
+    end
+
+    it "cannot be defeated by rescue/retry (uncatchable)" do
+      e = described_class.new(max_instructions: 50_000)
+      expect { e.eval("begin; loop {}; rescue Exception; retry; end") }
+        .to raise_error(Enclave::InstructionLimitError)
+      e.close
+    end
+
+    it "works without a wall-clock timeout (fuel-only)" do
+      e = described_class.new(max_instructions: 10_000, timeout: nil)
+      expect { e.eval("loop {}") }.to raise_error(Enclave::InstructionLimitError)
+      e.close
+    end
+
+    it "lets code within budget finish normally" do
+      e = described_class.new(max_instructions: 10_000_000)
+      expect(e.eval("2 + 2").value).to eq("4")
+      e.close
+    end
+
+    it "is unlimited by default" do
+      e = described_class.new(timeout: 5)
+      expect(e.max_instructions).to be_nil
+      e.close
+    end
+
+    it "InstructionLimitError is an Enclave::Error" do
+      expect(Enclave::InstructionLimitError).to be < Enclave::Error
+    end
+  end
+
+  # H8: the old fixed 64-function ceiling is gone; the tool surface grows on
+  # demand.
+  describe "unbounded tool functions (H8)" do
+    it "exposes and calls well past the old 64-function cap" do
+      mod = Module.new do
+        (1..100).each { |i| define_method("f#{i}") { i } }
+      end
+      e = described_class.new(timeout: 5)
+      e.expose(mod)
+      expect(e.exposed_functions.size).to eq(100)
+      expect(e.eval("f65").value).to eq("65")
+      expect(e.eval("f100").value).to eq("100")
+      e.close
+    end
+  end
+
+  # H9: Symbols are coerced to Strings across the boundary, in both directions
+  # and inside nested structures. Intentional and documented — these pin it.
+  describe "symbol/string boundary coercion (H9)" do
+    module H9Tools
+      def echo(x); x; end                       # returns the arg back
+      def klass(x); x.class.to_s; end            # what type did the tool receive?
+      def sym_hash; { a: :b, c: [:d] }; end       # symbols in keys and values
+    end
+
+    let(:e) { described_class.new(tools: H9Tools, timeout: 5) }
+    after { e.close unless e.closed? }
+
+    it "delivers a symbol argument to the tool as a String" do
+      expect(e.eval('klass(:hello)').value).to eq('"String"')
+    end
+
+    it "returns a symbol from the tool to the sandbox as a String" do
+      expect(e.eval('echo(:world)').value).to eq('"world"')
+    end
+
+    it "stringifies symbol hash keys and values, including nested" do
+      expect(e.eval('sym_hash["a"]').value).to eq('"b"')
+      expect(e.eval('sym_hash["c"]').value).to eq('["d"]')
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError
@@ -735,6 +1364,18 @@ RSpec.describe Enclave do
     it "memory_limit returns nil when unlimited" do
       e = described_class.new(memory_limit: nil)
       expect(e.memory_limit).to be_nil
+      e.close
+    end
+
+    it "max_output_bytes returns configured value" do
+      e = described_class.new(max_output_bytes: 4_096)
+      expect(e.max_output_bytes).to eq(4_096)
+      e.close
+    end
+
+    it "max_output_bytes returns nil when explicitly unlimited" do
+      e = described_class.new(max_output_bytes: nil)
+      expect(e.max_output_bytes).to be_nil
       e.close
     end
   end

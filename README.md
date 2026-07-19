@@ -127,6 +127,51 @@ enclave.expose(NotificationTools.new(user))
 
 All methods from all exposed objects are available as functions in the enclave.
 
+### Controlling the surface
+
+By default **every** public method of an exposed object is callable from the sandbox — so a helper you forget to make private is silently reachable by untrusted code. Narrow the surface explicitly:
+
+```ruby
+enclave.expose(tools, only:   %i[search fetch])    # allowlist (recommended)
+enclave.expose(tools, except: %i[internal_cache])  # denylist
+```
+
+A name in `only:`/`except:` that isn't an exposable public method raises `ArgumentError`, so a typo can't silently misname an allowlist or leave a method exposed that you meant to hide.
+
+Check the exact capability surface — useful as a test assertion so a newly-added public method can't sneak in:
+
+```ruby
+enclave.exposed_functions  #=> [:search, :fetch]
+```
+
+### Network access with HttpTool
+
+Giving sandboxed code HTTP is the classic SSRF pivot: it can aim your server's network position at internal services or the cloud metadata endpoint (`169.254.169.254`). `Enclave::HttpTool` is an optional, batteries-included network tool that gets this right. Require it explicitly (it pulls in `net/http`):
+
+```ruby
+require "enclave/http_tool"
+
+http = Enclave::HttpTool.new(allow: %w[api.example.com *.githubusercontent.com])
+enclave.expose(http)
+
+enclave.eval(<<~RUBY)
+  resp = get("https://api.example.com/status")
+  resp["status"]  # 200
+  resp["body"]    # parsed Hash if the response was JSON, else the String
+RUBY
+```
+
+The sandbox gets `request(method, url, headers = {}, body = nil)` plus `get`/`post`/`put`/`patch`/`delete`/`head`. Only those verbs are exposed — the budgets, validators, and DNS handling stay private. Each request is checked, in order:
+
+1. **Budget** — request count and cumulative wall-clock across the tool's lifetime (the enclave timeout never counts host time).
+2. **URL** — http/https only, no `user:pass@` userinfo, no IP-literal hosts, a port allowlist (`[80, 443]` by default), CR/LF/NUL rejected.
+3. **Allowlist** — hostname label-suffix matching, so `*.example.com` matches `a.example.com` but never `example.com.evil.com`. Pass `allow: :any` to skip *only* the allowlist; the SSRF floor below still holds.
+4. **Headers** — `Host`/`Content-Length`/`Transfer-Encoding`/`Connection` blocked, token-charset names enforced, CR/LF rejected. `Authorization` is allowed — you set your own credentials.
+5. **DNS + IP** — the host is resolved once, every resolved address is rejected if it falls in a private/link-local/metadata range, and the connection is then **pinned to the vetted IP** so a rebinding resolver can't swap it after the check.
+6. **Response** — the body is capped while streaming (`max_response_bytes`); redirects are returned to the sandbox, never auto-followed.
+
+Denied requests raise `Enclave::HttpTool::DeniedError` (surfaced to the sandbox as an error). Tunable: `max_requests:`, `request_timeout:`, `total_time_budget:`, `max_response_bytes:`, `allowed_ports:`, and `on_request:` (a host-side callable for auditing/metering). Hash/Array bodies are JSON-encoded and JSON responses parsed host-side, since the sandbox build carries no JSON.
+
 ### Allowed types
 
 Values crossing the boundary must be one of:
@@ -136,7 +181,7 @@ Values crossing the boundary must be one of:
 | `nil`, `true`, `false` | |
 | `Integer`, `Float` | |
 | `String` | |
-| `Symbol` | Converted to `String` automatically |
+| `Symbol` | **Converted to `String`** — see the gotcha below |
 | `Array` | Elements must be allowed types |
 | `Hash` | Keys and values must be allowed types |
 
@@ -147,6 +192,16 @@ TypeError: unsupported type for sandbox: User
 ```
 
 This means you need to serialize your data into hashes. That's a feature, not a bug. It forces you to be explicit about what the LLM can see.
+
+**Symbols do not survive the boundary.** They are coerced to strings in *both* directions and *inside nested structures* — a tool that returns `{ status: :ok }` is seen by the sandbox as `{ "status" => "ok" }`, and a symbol the sandbox passes to a tool arrives as a string. This is intentional (mruby and CRuby symbol tables are separate), but it bites when you compare or index by symbol:
+
+```ruby
+# tool returns { state: :active }
+enclave.eval('user_status[:state]')   #=> nil   — the key is "state", not :state
+enclave.eval('user_status["state"]')  #=> "active"
+```
+
+Normalize on symbols host-side (in the tool) if you need symbol-keyed access; from inside the sandbox, always index returned hashes with strings.
 
 ### Error handling
 
@@ -228,8 +283,14 @@ enclave = Enclave.new(tools: tools, timeout: 5, memory_limit: 10_000_000)
 
 | Option | What it does | Default |
 |--------|-------------|---------|
-| `timeout:` | Max seconds of mruby execution | `nil` (unlimited) |
+| `timeout:` | Max seconds of mruby execution (wall-clock) | `nil` (unlimited) |
+| `max_instructions:` | Max mruby instructions executed — a deterministic CPU bound, independent of host load | `nil` (unlimited) |
 | `memory_limit:` | Max bytes of mruby heap | `nil` (unlimited) |
+| `max_output_bytes:` | Max bytes of captured `puts`/`print`/`p` output | `10 * 1024 * 1024` |
+| `max_tool_calls:` | Max tool calls per `eval` | `nil` (unlimited) |
+| `max_tool_seconds:` | Max cumulative wall-clock spent in tool calls per `eval` | `nil` (unlimited) |
+
+`timeout` and `max_instructions` are complementary: `timeout` bounds *time*, `max_instructions` bounds *work* (same input → same cutoff, regardless of how loaded the host is — useful for reproducible limits). Both are uncatchable: sandboxed code can't `rescue` its way past them.
 
 When a limit is hit, the enclave raises instead of returning a Result:
 
@@ -239,9 +300,19 @@ enclave.eval("loop {}")
 
 enclave.eval('"x" * 10_000_000')
 #=> Enclave::MemoryLimitError: NoMemoryError
+
+# with max_instructions: 1_000_000
+enclave.eval("i = 0; i += 1 while true")
+#=> Enclave::InstructionLimitError: instruction limit exceeded
+
+# with max_tool_calls: 50
+enclave.eval("1000.times { some_tool }")
+#=> Enclave::ToolBudgetError: tool-call count budget exceeded (max 50)
 ```
 
-Both inherit from `Enclave::Error < StandardError`, so you can rescue them together:
+`max_output_bytes` is the exception: rather than raise, it truncates the captured output (with a marker) so the code still runs. It defaults to a non-nil cap because the output buffer is host memory that `memory_limit` does not count — set it to `nil` for unlimited.
+
+The raising limits inherit from `Enclave::Error < StandardError`, so you can rescue them together:
 
 ```ruby
 begin
@@ -267,7 +338,37 @@ Per-instance values override the defaults. `nil` means unlimited.
 
 ### What counts toward limits
 
-Only mruby execution counts. When the sandbox calls one of your tool methods, that Ruby code runs in CRuby and is not subject to the timeout or memory limit. This is intentional: limits protect the host from the sandbox, not from your own code.
+`timeout` and `memory_limit` cover only mruby execution. When the sandbox calls one of your tool methods, that Ruby code runs in CRuby and is **not** subject to them — so a sandbox that makes many (or slow) tool calls could still tie up a worker. `max_tool_calls` and `max_tool_seconds` bound exactly that: the number of tool calls and the cumulative wall-clock spent in them, per `eval`. The time budget can overshoot by at most one call, since a tool method already running can't be interrupted.
+
+### Tool-call hooks
+
+Pass callables to run around every tool call — for metering, logging, or rate limiting — without wrapping your tool object:
+
+```ruby
+enclave = Enclave.new(
+  tools: tools,
+  before_tool_call: ->(name, args) { StatsD.increment("tool.#{name}") },
+  after_tool_call:  ->(name, args, result) { logger.debug("#{name} -> #{result.class}") },
+)
+```
+
+`before_tool_call` runs before the method; raising in it **vetoes** the call (useful for rate limiting). `after_tool_call` runs after, with the return value. Both can also be assigned after construction (`enclave.before_tool_call = ...`).
+
+### Sanitizing tool errors
+
+When a tool method raises, its message crosses back into the sandbox verbatim — which can leak host internals (SQL fragments, file paths, IDs, third-party error bodies) to the code author. Pass an `error_sanitizer` to control what the sandbox sees, while you keep the full error host-side:
+
+```ruby
+enclave = Enclave.new(
+  tools: tools,
+  error_sanitizer: ->(name, exc) {
+    Rails.logger.error("tool #{name} failed: #{exc.full_message}")
+    "#{name} failed"           # message the sandbox sees; or exc.class.to_s for class-only
+  },
+)
+```
+
+Only the tool method's own exception is sanitized — a `before_tool_call` veto passes through, since that message is yours. If the sanitizer itself raises or returns `nil`, the sandbox gets a generic `"tool call failed"` and nothing leaks. This matters most once behaviors are authored by a less-trusted party (e.g. an LLM); for a trusted developer the default pass-through is fine for debugging.
 
 ## Safety
 
@@ -308,7 +409,7 @@ Enclave blocks the LLM from accessing your system. It does **not** protect again
 
 **Don't reuse enclave instances across users.** State persists between evals. If you reuse an enclave across different users to save on init cost, user A's variables and method definitions are visible to user B's eval.
 
-**ReDoS.** MRuby supports regex. The LLM can write a catastrophic backtracking pattern like `/^(a+)+$/` against a long string and burn CPU. Same effect as `loop {}` but harder to spot.
+**Unpreemptable C builtins (ReDoS).** The timeout is checked between mruby bytecode instructions, so it cannot interrupt a *single* long-running C builtin — the whole builtin runs before the next check. Allocation-heavy builtins (`"x" * 999_999_999`, oversized arrays, bignum exponentiation) are stopped by `memory_limit` or mruby's own size caps, but a pure-CPU one is unbounded. The classic case is a catastrophic-backtracking regex like `/^(a+)+$/` against a long string — same effect as `loop {}` but harder to spot. For that reason this build ships **without** `Regexp`: `ext/enclave/sandbox_build_config.rb` refuses to compile any regex or host-access gem unless you set `ENCLAVE_ALLOW_UNSAFE_GEMS=1`. If you re-enable regex, you re-open ReDoS — pair it with a strict `timeout` and treat authors as untrusted.
 
 **Your API bill.** Nothing stops the LLM from deciding it needs 15 evals to answer one question. Each one is a round-trip through your LLM provider. Cap the number of tool call rounds in your chat loop.
 
