@@ -1214,6 +1214,108 @@ RSpec.describe Enclave do
     end
   end
 
+  # H1 (deferred): a deterministic instruction "fuel" budget alongside the
+  # wall-clock timeout — bounds CPU independent of host load, and is uncatchable
+  # the same way the timeout is.
+  describe "max_instructions fuel budget (H1)" do
+    it "raises InstructionLimitError when the budget is exhausted" do
+      e = described_class.new(max_instructions: 100_000)
+      expect { e.eval("i = 0; while true; i += 1; end") }.to raise_error(Enclave::InstructionLimitError)
+      e.close
+    end
+
+    it "is deterministic — the same code hits the same hard boundary" do
+      code = "n = 0; 1000.times { n += 1 }; n"
+      needed = (1..50_000).bsearch do |fuel|
+        e = described_class.new(max_instructions: fuel)
+        ok = begin; e.eval(code); true; rescue Enclave::InstructionLimitError; false; end
+        e.close
+        ok
+      end
+      expect(needed).to be_a(Integer)
+      # one below always fails, at-threshold always succeeds, across runs
+      3.times do
+        below = described_class.new(max_instructions: needed - 1)
+        expect { below.eval(code) }.to raise_error(Enclave::InstructionLimitError)
+        below.close
+        at = described_class.new(max_instructions: needed)
+        expect(at.eval(code).error?).to be false
+        at.close
+      end
+    end
+
+    it "cannot be defeated by rescue/retry (uncatchable)" do
+      e = described_class.new(max_instructions: 50_000)
+      expect { e.eval("begin; loop {}; rescue Exception; retry; end") }
+        .to raise_error(Enclave::InstructionLimitError)
+      e.close
+    end
+
+    it "works without a wall-clock timeout (fuel-only)" do
+      e = described_class.new(max_instructions: 10_000, timeout: nil)
+      expect { e.eval("loop {}") }.to raise_error(Enclave::InstructionLimitError)
+      e.close
+    end
+
+    it "lets code within budget finish normally" do
+      e = described_class.new(max_instructions: 10_000_000)
+      expect(e.eval("2 + 2").value).to eq("4")
+      e.close
+    end
+
+    it "is unlimited by default" do
+      e = described_class.new(timeout: 5)
+      expect(e.max_instructions).to be_nil
+      e.close
+    end
+
+    it "InstructionLimitError is an Enclave::Error" do
+      expect(Enclave::InstructionLimitError).to be < Enclave::Error
+    end
+  end
+
+  # H8: the old fixed 64-function ceiling is gone; the tool surface grows on
+  # demand.
+  describe "unbounded tool functions (H8)" do
+    it "exposes and calls well past the old 64-function cap" do
+      mod = Module.new do
+        (1..100).each { |i| define_method("f#{i}") { i } }
+      end
+      e = described_class.new(timeout: 5)
+      e.expose(mod)
+      expect(e.exposed_functions.size).to eq(100)
+      expect(e.eval("f65").value).to eq("65")
+      expect(e.eval("f100").value).to eq("100")
+      e.close
+    end
+  end
+
+  # H9: Symbols are coerced to Strings across the boundary, in both directions
+  # and inside nested structures. Intentional and documented — these pin it.
+  describe "symbol/string boundary coercion (H9)" do
+    module H9Tools
+      def echo(x); x; end                       # returns the arg back
+      def klass(x); x.class.to_s; end            # what type did the tool receive?
+      def sym_hash; { a: :b, c: [:d] }; end       # symbols in keys and values
+    end
+
+    let(:e) { described_class.new(tools: H9Tools, timeout: 5) }
+    after { e.close unless e.closed? }
+
+    it "delivers a symbol argument to the tool as a String" do
+      expect(e.eval('klass(:hello)').value).to eq('"String"')
+    end
+
+    it "returns a symbol from the tool to the sandbox as a String" do
+      expect(e.eval('echo(:world)').value).to eq('"world"')
+    end
+
+    it "stringifies symbol hash keys and values, including nested" do
+      expect(e.eval('sym_hash["a"]').value).to eq('"b"')
+      expect(e.eval('sym_hash["c"]').value).to eq('["d"]')
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError

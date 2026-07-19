@@ -20,7 +20,8 @@ typedef enum {
     SANDBOX_ERROR_RUNTIME,
     SANDBOX_ERROR_TIMEOUT,
     SANDBOX_ERROR_MEMORY_LIMIT,
-    SANDBOX_ERROR_TOOL_BUDGET
+    SANDBOX_ERROR_TOOL_BUDGET,
+    SANDBOX_ERROR_INSTRUCTION_LIMIT
 } sandbox_error_kind_t;
 
 /* Result from an eval */
@@ -89,7 +90,8 @@ int sandbox_state_define_function(sandbox_state_t *state, const char *name);
 /* ------------------------------------------------------------------ */
 
 sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
-                                   int max_tool_calls, double max_tool_seconds);
+                                   int max_tool_calls, double max_tool_seconds,
+                                   uint64_t max_instructions);
 
 /* Bytes currently tracked by the memory limiter. Nonzero right after
  * construction confirms our mrb_basic_alloc_func override is intercepting

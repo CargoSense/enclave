@@ -14,6 +14,7 @@ static VALUE cEnclaveError;
 static VALUE cEnclaveTimeoutError;
 static VALUE cEnclaveMemoryLimitError;
 static VALUE cEnclaveToolBudgetError;
+static VALUE cEnclaveInstructionLimitError;
 
 /* Cached method id for the Ruby-side tool dispatcher */
 static ID id_dispatch_tool;
@@ -96,7 +97,8 @@ rb_to_sandbox_value(VALUE v, sandbox_value_t *out, char *errbuf, size_t errbuf_s
         return 0;
     }
     if (RB_TYPE_P(v, T_SYMBOL)) {
-        /* Symbol -> String */
+        /* Symbol -> String (H9): intentional, lossy coercion — symbols do not
+         * round-trip across the boundary. See README "Allowed types". */
         VALUE s = rb_sym2str(v);
         out->type = SANDBOX_VALUE_STRING;
         out->as.str.len = (size_t)RSTRING_LEN(s);
@@ -283,7 +285,7 @@ enclave_alloc(VALUE klass)
 
 static VALUE
 enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb_max_output_bytes,
-                   VALUE rb_max_tool_calls, VALUE rb_max_tool_seconds)
+                   VALUE rb_max_tool_calls, VALUE rb_max_tool_seconds, VALUE rb_max_instructions)
 {
     rb_enclave_t *sb;
     TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
@@ -293,9 +295,10 @@ enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb
     size_t max_output_bytes = NIL_P(rb_max_output_bytes) ? 0 : (size_t)NUM2ULL(rb_max_output_bytes);
     int max_tool_calls = NIL_P(rb_max_tool_calls) ? 0 : NUM2INT(rb_max_tool_calls);
     double max_tool_seconds = NIL_P(rb_max_tool_seconds) ? 0.0 : NUM2DBL(rb_max_tool_seconds);
+    uint64_t max_instructions = NIL_P(rb_max_instructions) ? 0 : (uint64_t)NUM2ULL(rb_max_instructions);
 
     sb->state = sandbox_state_new(timeout, memory_limit, max_output_bytes,
-                                  max_tool_calls, max_tool_seconds);
+                                  max_tool_calls, max_tool_seconds, max_instructions);
     if (!sb->state) {
         rb_raise(rb_eRuntimeError, "failed to initialize mruby enclave");
     }
@@ -338,7 +341,7 @@ enclave_define_function(VALUE self, VALUE rb_name)
     const char *name = StringValueCStr(rb_name);
 
     if (sandbox_state_define_function(sb->state, name) != 0) {
-        rb_raise(rb_eRuntimeError, "too many tool functions (max %d)", 64);
+        rb_raise(rb_eRuntimeError, "failed to register tool function '%s' (out of memory)", name);
     }
 
     return self;
@@ -374,6 +377,13 @@ enclave_eval(VALUE self, VALUE rb_code)
         VALUE exc_msg = rb_str_new_cstr(msg);
         sandbox_result_free(&result);
         rb_exc_raise(rb_exc_new_str(cEnclaveToolBudgetError, exc_msg));
+    }
+    if (result.error_kind == SANDBOX_ERROR_INSTRUCTION_LIMIT) {
+        /* Fixed message: the uncatchable re-raise path carries the timeout
+         * string, but the host limit is the instruction budget. */
+        sandbox_result_free(&result);
+        rb_exc_raise(rb_exc_new_str(cEnclaveInstructionLimitError,
+                                    rb_str_new_cstr("instruction limit exceeded")));
     }
 
     VALUE value = result.value ? rb_str_new_cstr(result.value) : Qnil;
@@ -439,16 +449,18 @@ Init_enclave(void)
     cEnclaveTimeoutError = rb_define_class_under(cEnclave, "TimeoutError", cEnclaveError);
     cEnclaveMemoryLimitError = rb_define_class_under(cEnclave, "MemoryLimitError", cEnclaveError);
     cEnclaveToolBudgetError = rb_define_class_under(cEnclave, "ToolBudgetError", cEnclaveError);
+    cEnclaveInstructionLimitError = rb_define_class_under(cEnclave, "InstructionLimitError", cEnclaveError);
 
     rb_gc_register_mark_object(cEnclaveError);
     rb_gc_register_mark_object(cEnclaveTimeoutError);
     rb_gc_register_mark_object(cEnclaveMemoryLimitError);
     rb_gc_register_mark_object(cEnclaveToolBudgetError);
+    rb_gc_register_mark_object(cEnclaveInstructionLimitError);
 
     id_dispatch_tool = rb_intern("__dispatch_tool");
 
     rb_define_alloc_func(cEnclave, enclave_alloc);
-    rb_define_method(cEnclave, "_init",            enclave_initialize,      5);
+    rb_define_method(cEnclave, "_init",            enclave_initialize,      6);
     rb_define_method(cEnclave, "_eval",            enclave_eval,            1);
     rb_define_method(cEnclave, "_define_function", enclave_define_function, 1);
     rb_define_method(cEnclave, "reset!",           enclave_reset,           0);

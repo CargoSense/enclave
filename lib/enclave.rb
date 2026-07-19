@@ -17,11 +17,13 @@ class Enclave
   DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
   class << self
-    attr_accessor :timeout, :memory_limit, :max_output_bytes, :max_tool_calls, :max_tool_seconds
+    attr_accessor :timeout, :memory_limit, :max_output_bytes, :max_tool_calls, :max_tool_seconds,
+                  :max_instructions
   end
   self.max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
 
-  attr_reader :timeout, :memory_limit, :max_output_bytes, :max_tool_calls, :max_tool_seconds
+  attr_reader :timeout, :memory_limit, :max_output_bytes, :max_tool_calls, :max_tool_seconds,
+              :max_instructions
 
   # Hooks invoked around every tool call (H4). Callables (or nil):
   #   before_tool_call.call(name_symbol, args_array)          — may raise to veto
@@ -43,6 +45,7 @@ class Enclave
   def initialize(tools: nil, timeout: self.class.timeout, memory_limit: self.class.memory_limit,
                  max_output_bytes: self.class.max_output_bytes,
                  max_tool_calls: self.class.max_tool_calls, max_tool_seconds: self.class.max_tool_seconds,
+                 max_instructions: self.class.max_instructions,
                  before_tool_call: nil, after_tool_call: nil, error_sanitizer: nil)
     @tool_context = Object.new
     @timeout = timeout
@@ -50,21 +53,24 @@ class Enclave
     @max_output_bytes = max_output_bytes
     @max_tool_calls = max_tool_calls
     @max_tool_seconds = max_tool_seconds
+    @max_instructions = max_instructions
     @before_tool_call = before_tool_call
     @after_tool_call = after_tool_call
     @error_sanitizer = error_sanitizer
     @exposed_functions = []
-    _init(@timeout, @memory_limit, @max_output_bytes, @max_tool_calls, @max_tool_seconds)
+    _init(@timeout, @memory_limit, @max_output_bytes, @max_tool_calls, @max_tool_seconds, @max_instructions)
     expose(tools) if tools
   end
 
   def self.open(tools: nil, timeout: self.timeout, memory_limit: self.memory_limit,
                 max_output_bytes: self.max_output_bytes,
                 max_tool_calls: self.max_tool_calls, max_tool_seconds: self.max_tool_seconds,
+                max_instructions: self.max_instructions,
                 before_tool_call: nil, after_tool_call: nil, error_sanitizer: nil)
     sandbox = new(tools: tools, timeout: timeout, memory_limit: memory_limit,
                   max_output_bytes: max_output_bytes,
                   max_tool_calls: max_tool_calls, max_tool_seconds: max_tool_seconds,
+                  max_instructions: max_instructions,
                   before_tool_call: before_tool_call, after_tool_call: after_tool_call,
                   error_sanitizer: error_sanitizer)
     begin

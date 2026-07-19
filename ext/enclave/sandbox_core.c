@@ -115,9 +115,12 @@ mrb_basic_alloc_func(void *ptr, size_t size)
 
 typedef struct {
     struct timespec  deadline;
-    int              expired;
+    int              expired;         /* in the uncatchable abort state (timeout or fuel) */
     unsigned int     check_counter;
     const mrb_code  *last_raise_pc;  /* pc of the previous post-expiry re-raise */
+    uint64_t         fuel;            /* instructions still allowed (if fuel_limited) */
+    int              fuel_limited;    /* deterministic instruction budget enforced? */
+    int              fuel_exhausted;  /* abort was triggered by fuel (for classification) */
 } timeout_state_t;
 
 /* ------------------------------------------------------------------ */
@@ -206,8 +209,6 @@ output_buf_append(output_buf_t *ob, const char *str, size_t slen)
 /* Sandbox internal state                                              */
 /* ------------------------------------------------------------------ */
 
-#define SANDBOX_MAX_FUNCTIONS 64
-
 struct sandbox_state {
     mrb_state    *mrb;
     mrb_ccontext *cxt;
@@ -219,14 +220,17 @@ struct sandbox_state {
     sandbox_callback_func_t callback;
     void                   *callback_userdata;
 
-    /* Registered function names (survive reset) */
-    char *func_names[SANDBOX_MAX_FUNCTIONS];
-    int   func_count;
+    /* Registered function names (survive reset). Grown on demand — no fixed
+     * ceiling; the count is bounded by the tool methods the host exposes. */
+    char **func_names;
+    int    func_count;
+    int    func_capacity;
 
     /* Resource limits */
     double          timeout_seconds;   /* 0 = unlimited */
     size_t          memory_limit;      /* 0 = unlimited */
     size_t          max_output_bytes;  /* cap on captured output; 0 = unlimited */
+    uint64_t        max_instructions;  /* deterministic fuel budget; 0 = unlimited */
     mem_tracker_t   mem_tracker;
     timeout_state_t timeout_state;
 
@@ -288,6 +292,22 @@ sandbox_code_fetch_hook(struct mrb_state *mrb, const struct mrb_irep *irep,
         ts->last_raise_pc = pc;
         mrb_raise(mrb, terr, "execution timeout exceeded");
         return; /* unreachable: mrb_raise does not return */
+    }
+
+    /* Deterministic instruction ("fuel") budget: bounds CPU independent of host
+     * load and even if the clock misbehaves. Checked every fetch. On exhaustion
+     * enter the same uncatchable abort path as the wall-clock timeout (raising
+     * the same class so `rescue` still can't defeat it); classification tells
+     * the two apart via fuel_exhausted. */
+    if (ts->fuel_limited) {
+        if (ts->fuel == 0) {
+            ts->expired = 1;
+            ts->fuel_exhausted = 1;
+            ts->last_raise_pc = pc;
+            mrb_raise(mrb, terr, "instruction limit exceeded");
+            return; /* unreachable */
+        }
+        ts->fuel--;
     }
 
     /* Only check the wall clock every N instructions to keep overhead low. */
@@ -383,7 +403,9 @@ mrb_to_sandbox_value(mrb_state *mrb, mrb_value v, sandbox_value_t *out, char *er
         return 0;
     }
     if (mrb_symbol_p(v)) {
-        /* Symbol → String */
+        /* Symbol → String (H9): intentional, lossy coercion. mruby and CRuby
+         * symbol tables are separate, so symbols do not round-trip; the boundary
+         * only ever carries strings. Documented in README "Allowed types". */
         out->type = SANDBOX_VALUE_STRING;
         mrb_int slen;
         const char *sname = mrb_sym_name_len(mrb, mrb_symbol(v), &slen);
@@ -741,7 +763,7 @@ sandbox_setup_mrb(sandbox_state_t *state)
 
 sandbox_state_t *
 sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
-                  int max_tool_calls, double max_tool_seconds)
+                  int max_tool_calls, double max_tool_seconds, uint64_t max_instructions)
 {
     sandbox_state_t *state = calloc(1, sizeof(sandbox_state_t));
     if (!state) return NULL;
@@ -751,6 +773,7 @@ sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
     state->max_output_bytes = max_output_bytes;
     state->max_tool_calls = max_tool_calls;
     state->max_tool_seconds = max_tool_seconds;
+    state->max_instructions = max_instructions;
 
     /* Activate tracker with limit=0 (unlimited) during init so all
      * allocations get the size header prepended. */
@@ -814,6 +837,7 @@ sandbox_state_free(sandbox_state_t *state)
     for (int i = 0; i < state->func_count; i++) {
         free(state->func_names[i]);
     }
+    free(state->func_names);
     free(state);
 }
 
@@ -835,6 +859,9 @@ sandbox_limits_begin(sandbox_state_t *state)
     state->timeout_state.expired = 0;
     state->timeout_state.check_counter = 0;
     state->timeout_state.last_raise_pc = NULL;
+    state->timeout_state.fuel = state->max_instructions;
+    state->timeout_state.fuel_limited = (state->max_instructions > 0);
+    state->timeout_state.fuel_exhausted = 0;
     if (state->timeout_seconds > 0) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -846,12 +873,16 @@ sandbox_limits_begin(sandbox_state_t *state)
             state->timeout_state.deadline.tv_sec++;
             state->timeout_state.deadline.tv_nsec -= 1000000000L;
         }
-        state->mrb->code_fetch_hook = sandbox_code_fetch_hook;
     } else {
         state->timeout_state.deadline.tv_sec = 0;
         state->timeout_state.deadline.tv_nsec = 0;
-        state->mrb->code_fetch_hook = NULL;
     }
+
+    /* The hook drives both the wall-clock timeout and the fuel budget, so
+     * install it if either is active. */
+    state->mrb->code_fetch_hook =
+        (state->timeout_seconds > 0 || state->timeout_state.fuel_limited)
+            ? sandbox_code_fetch_hook : NULL;
 
     return prev;
 }
@@ -868,6 +899,11 @@ sandbox_limits_end(sandbox_state_t *state)
 static sandbox_error_kind_t
 sandbox_classify_error(sandbox_state_t *state)
 {
+    /* Fuel exhaustion shares the timeout's abort path (expired is set), so check
+     * it first to report the deterministic limit distinctly. */
+    if (state->timeout_state.fuel_exhausted) {
+        return SANDBOX_ERROR_INSTRUCTION_LIMIT;
+    }
     if (state->timeout_state.expired) {
         return SANDBOX_ERROR_TIMEOUT;
     }
@@ -1103,10 +1139,17 @@ sandbox_state_set_callback(sandbox_state_t *state,
 int
 sandbox_state_define_function(sandbox_state_t *state, const char *name)
 {
-    if (state->func_count >= SANDBOX_MAX_FUNCTIONS) return -1;
+    if (state->func_count >= state->func_capacity) {
+        int newcap = state->func_capacity == 0 ? 16 : state->func_capacity * 2;
+        char **grown = realloc(state->func_names, (size_t)newcap * sizeof(char *));
+        if (!grown) return -1;
+        state->func_names = grown;
+        state->func_capacity = newcap;
+    }
 
-    state->func_names[state->func_count] = strdup(name);
-    state->func_count++;
+    char *copy = strdup(name);
+    if (!copy) return -1;
+    state->func_names[state->func_count++] = copy;
 
     /* Register in the current mruby state */
     struct RClass *kernel = state->mrb->kernel_module;

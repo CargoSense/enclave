@@ -181,7 +181,7 @@ Values crossing the boundary must be one of:
 | `nil`, `true`, `false` | |
 | `Integer`, `Float` | |
 | `String` | |
-| `Symbol` | Converted to `String` automatically |
+| `Symbol` | **Converted to `String`** — see the gotcha below |
 | `Array` | Elements must be allowed types |
 | `Hash` | Keys and values must be allowed types |
 
@@ -192,6 +192,16 @@ TypeError: unsupported type for sandbox: User
 ```
 
 This means you need to serialize your data into hashes. That's a feature, not a bug. It forces you to be explicit about what the LLM can see.
+
+**Symbols do not survive the boundary.** They are coerced to strings in *both* directions and *inside nested structures* — a tool that returns `{ status: :ok }` is seen by the sandbox as `{ "status" => "ok" }`, and a symbol the sandbox passes to a tool arrives as a string. This is intentional (mruby and CRuby symbol tables are separate), but it bites when you compare or index by symbol:
+
+```ruby
+# tool returns { state: :active }
+enclave.eval('user_status[:state]')   #=> nil   — the key is "state", not :state
+enclave.eval('user_status["state"]')  #=> "active"
+```
+
+Normalize on symbols host-side (in the tool) if you need symbol-keyed access; from inside the sandbox, always index returned hashes with strings.
 
 ### Error handling
 
@@ -273,11 +283,14 @@ enclave = Enclave.new(tools: tools, timeout: 5, memory_limit: 10_000_000)
 
 | Option | What it does | Default |
 |--------|-------------|---------|
-| `timeout:` | Max seconds of mruby execution | `nil` (unlimited) |
+| `timeout:` | Max seconds of mruby execution (wall-clock) | `nil` (unlimited) |
+| `max_instructions:` | Max mruby instructions executed — a deterministic CPU bound, independent of host load | `nil` (unlimited) |
 | `memory_limit:` | Max bytes of mruby heap | `nil` (unlimited) |
 | `max_output_bytes:` | Max bytes of captured `puts`/`print`/`p` output | `10 * 1024 * 1024` |
 | `max_tool_calls:` | Max tool calls per `eval` | `nil` (unlimited) |
 | `max_tool_seconds:` | Max cumulative wall-clock spent in tool calls per `eval` | `nil` (unlimited) |
+
+`timeout` and `max_instructions` are complementary: `timeout` bounds *time*, `max_instructions` bounds *work* (same input → same cutoff, regardless of how loaded the host is — useful for reproducible limits). Both are uncatchable: sandboxed code can't `rescue` its way past them.
 
 When a limit is hit, the enclave raises instead of returning a Result:
 
@@ -287,6 +300,10 @@ enclave.eval("loop {}")
 
 enclave.eval('"x" * 10_000_000')
 #=> Enclave::MemoryLimitError: NoMemoryError
+
+# with max_instructions: 1_000_000
+enclave.eval("i = 0; i += 1 while true")
+#=> Enclave::InstructionLimitError: instruction limit exceeded
 
 # with max_tool_calls: 50
 enclave.eval("1000.times { some_tool }")
