@@ -42,6 +42,7 @@ class Enclave
     @max_tool_seconds = max_tool_seconds
     @before_tool_call = before_tool_call
     @after_tool_call = after_tool_call
+    @exposed_functions = []
     _init(@timeout, @memory_limit, @max_output_bytes, @max_tool_calls, @max_tool_seconds)
     expose(tools) if tools
   end
@@ -96,24 +97,64 @@ class Enclave
     puts "\n" if line.nil? # clean newline on Ctrl-D
   end
 
-  def expose(obj)
-    case obj
-    when Module
-      @tool_context.extend(obj)
-      obj.instance_methods(false).each do |name|
-        _define_function(name.to_s)
-      end
-    else
-      obj.public_methods(false).each do |name|
+  # The tool function names (symbols) currently reachable from the sandbox — the
+  # exact capability surface. Assert on this in a test to catch a public method
+  # that leaked in by accident.
+  def exposed_functions
+    @exposed_functions.dup
+  end
+
+  # Publish an object's (or module's) public methods as sandbox tools.
+  #
+  # By default EVERY public method becomes callable from untrusted code, so a
+  # helper you forget to make private is silently reachable. Narrow the surface
+  # explicitly:
+  #
+  #   expose(tools, only:   %i[search fetch])   # allowlist (recommended)
+  #   expose(tools, except: %i[internal_cache]) # denylist
+  #
+  # Names in only:/except: that aren't exposable public methods raise
+  # ArgumentError, so a typo can't silently widen (except:) or misname (only:)
+  # the surface.
+  def expose(obj, only: nil, except: nil)
+    raise ArgumentError, "expose: pass only: or except:, not both" if only && except
+
+    is_module = obj.is_a?(Module)
+    candidates = (is_module ? obj.instance_methods(false) : obj.public_methods(false)).map(&:to_sym)
+    names = filter_exposed(candidates, only: only, except: except)
+
+    @tool_context.extend(obj) if is_module
+
+    names.each do |name|
+      unless is_module
         target = obj
         @tool_context.define_singleton_method(name) { |*args| target.public_send(name, *args) }
-        _define_function(name.to_s)
       end
+      _define_function(name.to_s)
+      @exposed_functions << name unless @exposed_functions.include?(name)
     end
     self
   end
 
   private
+
+  # Resolve only:/except: against the exposable candidates, rejecting names that
+  # don't exist so silent surface changes can't slip through.
+  def filter_exposed(candidates, only:, except:)
+    if only
+      requested = Array(only).map(&:to_sym)
+      unknown = requested - candidates
+      raise ArgumentError, "expose only: not an exposable public method: #{unknown.join(', ')}" unless unknown.empty?
+      requested
+    elsif except
+      excluded = Array(except).map(&:to_sym)
+      unknown = excluded - candidates
+      raise ArgumentError, "expose except: not an exposable public method: #{unknown.join(', ')}" unless unknown.empty?
+      candidates - excluded
+    else
+      candidates
+    end
+  end
 
   # Invoked from the C tool trampoline for every tool call, so the before/after
   # hooks wrap the actual dispatch. A raise in before_tool_call vetoes the call.

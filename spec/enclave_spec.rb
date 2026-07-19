@@ -1012,6 +1012,92 @@ RSpec.describe Enclave do
     end
   end
 
+  # H5: expose publishes ALL public methods, so a helper you forget to make
+  # private is silently reachable by untrusted code. Provide explicit surface
+  # control (only:/except:) and make the surface visible/assertable.
+  describe "expose surface control (H5)" do
+    let(:service) do
+      Class.new do
+        def search(q); "results for #{q}"; end
+        def fetch(id); "item #{id}"; end
+        def internal_secret; "SECRET"; end # forgot to make private
+      end.new
+    end
+
+    module H5Kit
+      def a; 1; end
+      def b; 2; end
+      def c; 3; end
+    end
+
+    it "still exposes every public method by default (backward compatible)" do
+      e = described_class.new(tools: service)
+      expect(e.exposed_functions).to match_array(%i[search fetch internal_secret])
+      expect(e.eval("internal_secret").value).to eq('"SECRET"')
+      e.close
+    end
+
+    it "only: exposes exactly the allowlist" do
+      e = described_class.new
+      e.expose(service, only: %i[search fetch])
+      expect(e.exposed_functions).to match_array(%i[search fetch])
+      expect(e.eval("search('x')").value).to eq('"results for x"')
+      e.close
+    end
+
+    it "only: leaves other methods unreachable from the sandbox" do
+      e = described_class.new
+      e.expose(service, only: %i[search])
+      expect(e.eval("internal_secret").error?).to be true
+      e.close
+    end
+
+    it "except: hides the denylisted method" do
+      e = described_class.new
+      e.expose(service, except: %i[internal_secret])
+      expect(e.exposed_functions).to match_array(%i[search fetch])
+      expect(e.eval("internal_secret").error?).to be true
+      e.close
+    end
+
+    it "raises if both only: and except: are given" do
+      e = described_class.new
+      expect { e.expose(service, only: %i[search], except: %i[fetch]) }.to raise_error(ArgumentError)
+      e.close
+    end
+
+    it "raises on an unknown only: name (misnamed allowlist)" do
+      e = described_class.new
+      expect { e.expose(service, only: %i[serch]) }.to raise_error(ArgumentError, /serch/)
+      e.close
+    end
+
+    it "raises on an unknown except: name (typo must not silently expose)" do
+      e = described_class.new
+      expect { e.expose(service, except: %i[internal_secrett]) }.to raise_error(ArgumentError, /internal_secrett/)
+      e.close
+    end
+
+    it "honors only: for module tools" do
+      e = described_class.new
+      e.expose(H5Kit, only: %i[a b])
+      expect(e.exposed_functions).to match_array(%i[a b])
+      expect(e.eval("a + b").value).to eq("3")
+      expect(e.eval("c").error?).to be true
+      e.close
+    end
+
+    it "accumulates exposed_functions across calls and returns a copy" do
+      e = described_class.new
+      e.expose(service, only: %i[search])
+      e.expose(H5Kit, only: %i[a])
+      expect(e.exposed_functions).to match_array(%i[search a])
+      e.exposed_functions << :injected
+      expect(e.exposed_functions).not_to include(:injected)
+      e.close
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError

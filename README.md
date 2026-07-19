@@ -127,6 +127,23 @@ enclave.expose(NotificationTools.new(user))
 
 All methods from all exposed objects are available as functions in the enclave.
 
+### Controlling the surface
+
+By default **every** public method of an exposed object is callable from the sandbox — so a helper you forget to make private is silently reachable by untrusted code. Narrow the surface explicitly:
+
+```ruby
+enclave.expose(tools, only:   %i[search fetch])    # allowlist (recommended)
+enclave.expose(tools, except: %i[internal_cache])  # denylist
+```
+
+A name in `only:`/`except:` that isn't an exposable public method raises `ArgumentError`, so a typo can't silently misname an allowlist or leave a method exposed that you meant to hide.
+
+Check the exact capability surface — useful as a test assertion so a newly-added public method can't sneak in:
+
+```ruby
+enclave.exposed_functions  #=> [:search, :fetch]
+```
+
 ### Allowed types
 
 Values crossing the boundary must be one of:
