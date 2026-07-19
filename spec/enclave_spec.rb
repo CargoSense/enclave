@@ -781,6 +781,93 @@ RSpec.describe Enclave do
     end
   end
 
+  # H2: the captured output buffer lives in raw host memory and is not counted
+  # by memory_limit, so without its own cap a print loop is a direct host-OOM.
+  describe "max_output_bytes (H2)" do
+    it "caps captured output at the configured size" do
+      e = described_class.new(max_output_bytes: 50_000)
+      result = e.eval('100_000.times { print "x" }; "done"')
+      expect(result.output.bytesize).to be <= 50_100 # cap + short marker
+      e.close
+    end
+
+    it "still returns the value and no error when output is truncated" do
+      e = described_class.new(max_output_bytes: 10_000)
+      result = e.eval('100_000.times { print "x" }; 42')
+      expect(result.error?).to be false
+      expect(result.value).to eq("42")
+      e.close
+    end
+
+    it "appends a truncation marker when the cap is exceeded" do
+      e = described_class.new(max_output_bytes: 10_000)
+      result = e.eval('print "x" * 20_000')
+      expect(result.output).to include("truncated")
+      e.close
+    end
+
+    it "does NOT truncate or mark output that fits under the cap" do
+      e = described_class.new(max_output_bytes: 10_000)
+      result = e.eval('print "x" * 100')
+      expect(result.output.bytesize).to eq(100)
+      expect(result.output).not_to include("truncated")
+      e.close
+    end
+
+    it "keeps exactly the first max_output_bytes and drops the rest" do
+      e = described_class.new(max_output_bytes: 100)
+      result = e.eval('print("A" * 100); print("B" * 100)')
+      expect(result.output[0, 100]).to eq("A" * 100)
+      expect(result.output).not_to include("B")
+      e.close
+    end
+
+    it "treats 0 as unlimited (opt out)" do
+      e = described_class.new(max_output_bytes: 0)
+      result = e.eval('20_000.times { print "y" * 100 }; "done"') # ~2 MB
+      expect(result.output.bytesize).to eq(2_000_000)
+      expect(result.output).not_to include("truncated")
+      e.close
+    end
+
+    it "is enforced by a safe non-nil default" do
+      expect(Enclave.max_output_bytes).to be_a(Integer)
+      expect(Enclave.max_output_bytes).to be > 0
+      e = described_class.new
+      expect(e.max_output_bytes).to eq(Enclave.max_output_bytes)
+      e.close
+    end
+
+    it "survives reset!" do
+      e = described_class.new(max_output_bytes: 1_000)
+      e.eval('print "x" * 5_000')
+      e.reset!
+      result = e.eval('print "z" * 5_000')
+      expect(result.output.bytesize).to be <= 1_100
+      expect(result.output).to include("truncated")
+      e.close
+    end
+
+    it "applies class-level default" do
+      begin
+        Enclave.max_output_bytes = 5_000
+        e = described_class.new
+        result = e.eval('print "x" * 20_000')
+        expect(result.output.bytesize).to be <= 5_100
+        e.close
+      ensure
+        Enclave.max_output_bytes = Enclave::DEFAULT_MAX_OUTPUT_BYTES
+      end
+    end
+
+    it "per-instance override beats the class-level default" do
+      e = described_class.new(max_output_bytes: 200)
+      result = e.eval('print "x" * 20_000')
+      expect(result.output.bytesize).to be <= 300
+      e.close
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError
@@ -829,6 +916,18 @@ RSpec.describe Enclave do
     it "memory_limit returns nil when unlimited" do
       e = described_class.new(memory_limit: nil)
       expect(e.memory_limit).to be_nil
+      e.close
+    end
+
+    it "max_output_bytes returns configured value" do
+      e = described_class.new(max_output_bytes: 4_096)
+      expect(e.max_output_bytes).to eq(4_096)
+      e.close
+    end
+
+    it "max_output_bytes returns nil when explicitly unlimited" do
+      e = described_class.new(max_output_bytes: nil)
+      expect(e.max_output_bytes).to be_nil
       e.close
     end
   end

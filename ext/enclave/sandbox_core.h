@@ -87,7 +87,7 @@ int sandbox_state_define_function(sandbox_state_t *state, const char *name);
 /* Core API                                                            */
 /* ------------------------------------------------------------------ */
 
-sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit);
+sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes);
 void             sandbox_state_free(sandbox_state_t *state);
 sandbox_result_t sandbox_state_eval(sandbox_state_t *state, const char *code);
 void             sandbox_state_reset(sandbox_state_t *state);

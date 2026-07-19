@@ -128,6 +128,8 @@ typedef struct {
     char  *buf;
     size_t len;
     size_t cap;
+    size_t max_bytes;   /* hard cap on len; 0 = unlimited */
+    int    truncated;   /* set once when the cap is first hit (reset per eval) */
 } output_buf_t;
 
 static void
@@ -136,6 +138,8 @@ output_buf_init(output_buf_t *ob)
     ob->buf = NULL;
     ob->len = 0;
     ob->cap = 0;
+    ob->max_bytes = 0;
+    ob->truncated = 0;
 }
 
 static void
@@ -147,24 +151,51 @@ output_buf_free(output_buf_t *ob)
     }
     ob->len = 0;
     ob->cap = 0;
+    ob->truncated = 0;
 }
 
 static void
 output_buf_reset(output_buf_t *ob)
 {
     ob->len = 0;
+    ob->truncated = 0;
     if (ob->buf) ob->buf[0] = '\0';
 }
 
+/* Append up to max_bytes of output. This buffer lives in raw host memory and is
+ * NOT tracked by memory_limit, so without its own cap a print loop is a direct
+ * host-OOM (H2). Once the cap is reached, further output is dropped and the
+ * truncated flag is set; a marker is added when the output is collected. Also
+ * hardened against realloc failure (previously unchecked). */
 static void
 output_buf_append(output_buf_t *ob, const char *str, size_t slen)
 {
     if (slen == 0) return;
+
+    if (ob->max_bytes > 0) {
+        if (ob->len >= ob->max_bytes) {
+            ob->truncated = 1;
+            return;
+        }
+        size_t remaining = ob->max_bytes - ob->len;
+        if (slen > remaining) {
+            slen = remaining;   /* write only what fits under the cap */
+            ob->truncated = 1;
+        }
+    }
+
     size_t needed = ob->len + slen + 1;
     if (needed > ob->cap) {
-        ob->cap = needed * 2;
-        if (ob->cap < 256) ob->cap = 256;
-        ob->buf = realloc(ob->buf, ob->cap);
+        size_t newcap = needed * 2;
+        if (newcap < 256) newcap = 256;
+        /* Never grow the allocation past the cap (+1 for the NUL). */
+        if (ob->max_bytes > 0 && newcap > ob->max_bytes + 1) {
+            newcap = ob->max_bytes + 1;
+        }
+        char *nb = realloc(ob->buf, newcap);
+        if (!nb) return;   /* OOM: keep prior buffer, drop this chunk */
+        ob->buf = nb;
+        ob->cap = newcap;
     }
     memcpy(ob->buf + ob->len, str, slen);
     ob->len += slen;
@@ -195,6 +226,7 @@ struct sandbox_state {
     /* Resource limits */
     double          timeout_seconds;   /* 0 = unlimited */
     size_t          memory_limit;      /* 0 = unlimited */
+    size_t          max_output_bytes;  /* cap on captured output; 0 = unlimited */
     mem_tracker_t   mem_tracker;
     timeout_state_t timeout_state;
 
@@ -671,13 +703,14 @@ sandbox_setup_mrb(sandbox_state_t *state)
 /* ------------------------------------------------------------------ */
 
 sandbox_state_t *
-sandbox_state_new(double timeout, size_t memory_limit)
+sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes)
 {
     sandbox_state_t *state = calloc(1, sizeof(sandbox_state_t));
     if (!state) return NULL;
 
     state->timeout_seconds = timeout;
     state->memory_limit = memory_limit;
+    state->max_output_bytes = max_output_bytes;
 
     /* Activate tracker with limit=0 (unlimited) during init so all
      * allocations get the size header prepended. */
@@ -705,6 +738,7 @@ sandbox_state_new(double timeout, size_t memory_limit)
     state->arena_idx = mrb_gc_arena_save(state->mrb);
 
     output_buf_init(&state->output);
+    state->output.max_bytes = max_output_bytes;
     sandbox_setup_mrb(state);
 
     mem_tracker_restore(prev);
@@ -804,6 +838,28 @@ strdup_safe(const char *s, size_t len)
     return d;
 }
 
+/* Build the captured-output string for a result, appending a marker if the
+ * output was truncated at max_output_bytes. Always returns a malloc'd string
+ * (never NULL) so callers can hand it straight to the result. */
+static char *
+sandbox_collect_output(sandbox_state_t *state)
+{
+    static const char marker[] = "\n[output truncated: max_output_bytes exceeded]";
+    output_buf_t *ob = &state->output;
+    size_t base = ob->len;
+
+    if (ob->truncated) {
+        size_t mlen = sizeof(marker) - 1;
+        char *out = malloc(base + mlen + 1);
+        if (!out) return strdup_safe("", 0);
+        if (base > 0) memcpy(out, ob->buf, base);
+        memcpy(out + base, marker, mlen);
+        out[base + mlen] = '\0';
+        return out;
+    }
+    return base > 0 ? strdup_safe(ob->buf, base) : strdup_safe("", 0);
+}
+
 sandbox_result_t
 sandbox_state_eval(sandbox_state_t *state, const char *code)
 {
@@ -839,9 +895,7 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
 
         result.error = strdup_safe(errbuf, strlen(errbuf));
         result.error_kind = SANDBOX_ERROR_RUNTIME;
-        result.output = state->output.len > 0
-            ? strdup_safe(state->output.buf, state->output.len)
-            : strdup_safe("", 0);
+        result.output = sandbox_collect_output(state);
         return result;
     }
 
@@ -853,9 +907,7 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
         mem_tracker_restore(prev);
         result.error = strdup_safe("code generation failed", 22);
         result.error_kind = SANDBOX_ERROR_RUNTIME;
-        result.output = state->output.len > 0
-            ? strdup_safe(state->output.buf, state->output.len)
-            : strdup_safe("", 0);
+        result.output = sandbox_collect_output(state);
         return result;
     }
 
@@ -876,9 +928,7 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
     sandbox_limits_end(state);
 
     /* Collect output */
-    result.output = state->output.len > 0
-        ? strdup_safe(state->output.buf, state->output.len)
-        : strdup_safe("", 0);
+    result.output = sandbox_collect_output(state);
 
     /* Check for exception */
     if (state->mrb->exc) {
@@ -942,6 +992,7 @@ sandbox_state_reset(sandbox_state_t *state)
         state->mrb = NULL;
     }
     output_buf_reset(&state->output);
+    state->output.max_bytes = state->max_output_bytes; /* keep the cap across reset */
 
     /* Recreate with tracked allocator (limit=0 during init) */
     state->mem_tracker.current = 0;

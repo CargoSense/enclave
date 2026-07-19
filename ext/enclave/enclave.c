@@ -281,15 +281,16 @@ enclave_alloc(VALUE klass)
 }
 
 static VALUE
-enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit)
+enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb_max_output_bytes)
 {
     rb_enclave_t *sb;
     TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
 
     double timeout = NIL_P(rb_timeout) ? 0.0 : NUM2DBL(rb_timeout);
     size_t memory_limit = NIL_P(rb_memory_limit) ? 0 : (size_t)NUM2ULL(rb_memory_limit);
+    size_t max_output_bytes = NIL_P(rb_max_output_bytes) ? 0 : (size_t)NUM2ULL(rb_max_output_bytes);
 
-    sb->state = sandbox_state_new(timeout, memory_limit);
+    sb->state = sandbox_state_new(timeout, memory_limit, max_output_bytes);
     if (!sb->state) {
         rb_raise(rb_eRuntimeError, "failed to initialize mruby enclave");
     }
@@ -412,7 +413,7 @@ Init_enclave(void)
     rb_gc_register_mark_object(cEnclaveMemoryLimitError);
 
     rb_define_alloc_func(cEnclave, enclave_alloc);
-    rb_define_method(cEnclave, "_init",            enclave_initialize,      2);
+    rb_define_method(cEnclave, "_init",            enclave_initialize,      3);
     rb_define_method(cEnclave, "_eval",            enclave_eval,            1);
     rb_define_method(cEnclave, "_define_function", enclave_define_function, 1);
     rb_define_method(cEnclave, "reset!",           enclave_reset,           0);

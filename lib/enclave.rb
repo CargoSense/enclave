@@ -9,22 +9,34 @@ rescue LoadError
 end
 
 class Enclave
+  # Default cap on captured puts/print/p output. The output buffer lives in raw
+  # host memory and is NOT counted by memory_limit, so it needs its own bound or
+  # a print loop is a direct host-OOM (H2). This default is deliberately non-nil
+  # so hosts are protected out of the box; set max_output_bytes: nil for
+  # unlimited (matching timeout/memory_limit, where nil means unlimited).
+  DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024
+
   class << self
-    attr_accessor :timeout, :memory_limit
+    attr_accessor :timeout, :memory_limit, :max_output_bytes
   end
+  self.max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
 
-  attr_reader :timeout, :memory_limit
+  attr_reader :timeout, :memory_limit, :max_output_bytes
 
-  def initialize(tools: nil, timeout: self.class.timeout, memory_limit: self.class.memory_limit)
+  def initialize(tools: nil, timeout: self.class.timeout, memory_limit: self.class.memory_limit,
+                 max_output_bytes: self.class.max_output_bytes)
     @tool_context = Object.new
     @timeout = timeout
     @memory_limit = memory_limit
-    _init(@timeout, @memory_limit)
+    @max_output_bytes = max_output_bytes
+    _init(@timeout, @memory_limit, @max_output_bytes)
     expose(tools) if tools
   end
 
-  def self.open(tools: nil, timeout: self.timeout, memory_limit: self.memory_limit)
-    sandbox = new(tools: tools, timeout: timeout, memory_limit: memory_limit)
+  def self.open(tools: nil, timeout: self.timeout, memory_limit: self.memory_limit,
+                max_output_bytes: self.max_output_bytes)
+    sandbox = new(tools: tools, timeout: timeout, memory_limit: memory_limit,
+                  max_output_bytes: max_output_bytes)
     begin
       yield sandbox
     ensure
