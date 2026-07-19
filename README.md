@@ -308,7 +308,7 @@ Enclave blocks the LLM from accessing your system. It does **not** protect again
 
 **Don't reuse enclave instances across users.** State persists between evals. If you reuse an enclave across different users to save on init cost, user A's variables and method definitions are visible to user B's eval.
 
-**ReDoS.** MRuby supports regex. The LLM can write a catastrophic backtracking pattern like `/^(a+)+$/` against a long string and burn CPU. Same effect as `loop {}` but harder to spot.
+**Unpreemptable C builtins (ReDoS).** The timeout is checked between mruby bytecode instructions, so it cannot interrupt a *single* long-running C builtin — the whole builtin runs before the next check. Allocation-heavy builtins (`"x" * 999_999_999`, oversized arrays, bignum exponentiation) are stopped by `memory_limit` or mruby's own size caps, but a pure-CPU one is unbounded. The classic case is a catastrophic-backtracking regex like `/^(a+)+$/` against a long string — same effect as `loop {}` but harder to spot. For that reason this build ships **without** `Regexp`: `ext/enclave/sandbox_build_config.rb` refuses to compile any regex or host-access gem unless you set `ENCLAVE_ALLOW_UNSAFE_GEMS=1`. If you re-enable regex, you re-open ReDoS — pair it with a strict `timeout` and treat authors as untrusted.
 
 **Your API bill.** Nothing stops the LLM from deciding it needs 15 evals to answer one question. Each one is a round-trip through your LLM provider. Cap the number of tool call rounds in your chat loop.
 

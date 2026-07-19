@@ -135,7 +135,8 @@ RSpec.describe Enclave do
     # nothing dangerous runs in the host process.
 
     describe "missing dangerous classes" do
-      %w[File IO Dir Socket Process Signal ENV ARGV STDIN STDOUT STDERR].each do |const|
+      %w[File IO Dir Socket Process Signal ENV ARGV STDIN STDOUT STDERR
+         Regexp MatchData].each do |const|
         it "has no #{const}" do
           result = enclave.eval(const)
           expect(result.error?).to be true
@@ -865,6 +866,54 @@ RSpec.describe Enclave do
       result = e.eval('print "x" * 20_000')
       expect(result.output.bytesize).to be <= 300
       e.close
+    end
+  end
+
+  # H3: the timeout (code_fetch_hook) fires only at bytecode-fetch boundaries, so
+  # a single long-running C builtin can't be preempted. Allocation-heavy builtins
+  # are bounded by memory_limit, but a pure-CPU one — a catastrophic-backtracking
+  # Regexp — is unbounded (ReDoS). The build therefore ships without Regexp; these
+  # are the runtime backstop for the build-time denylist guard.
+  describe "no unpreemptable regex builtin (H3)" do
+    it "does not define Regexp" do
+      expect(enclave.eval("Regexp").error?).to be true
+    end
+
+    it "does not define MatchData" do
+      expect(enclave.eval("MatchData").error?).to be true
+    end
+
+    it "rejects a regex literal (no Regexp to construct)" do
+      result = enclave.eval('/(a+)+$/')
+      expect(result.error?).to be true
+    end
+
+    it "rejects =~ against a regex" do
+      result = enclave.eval('"aaaa" =~ /a+/')
+      expect(result.error?).to be true
+    end
+
+    it "rejects String#match" do
+      result = enclave.eval('"aaaa".match(/a+/)')
+      expect(result.error?).to be true
+    end
+
+    # Allocation-heavy builtins that COULD run long are instead bounded (they
+    # raise before doing real work), so the absence of Regexp closes the gap.
+    it "bounds a huge String#* by memory_limit" do
+      e = described_class.new(timeout: 5, memory_limit: 20_000_000)
+      expect { e.eval('"x" * 500_000_000') }.to raise_error(Enclave::MemoryLimitError)
+      e.close
+    end
+
+    it "caps oversized Array allocation" do
+      result = enclave.eval("Array.new(500_000_000, 0)")
+      expect(result.error?).to be true
+    end
+
+    it "caps oversized bignum exponentiation" do
+      result = enclave.eval("10 ** 100_000_000")
+      expect(result.error?).to be true
     end
   end
 
