@@ -144,6 +144,34 @@ Check the exact capability surface — useful as a test assertion so a newly-add
 enclave.exposed_functions  #=> [:search, :fetch]
 ```
 
+### Network access with HttpTool
+
+Giving sandboxed code HTTP is the classic SSRF pivot: it can aim your server's network position at internal services or the cloud metadata endpoint (`169.254.169.254`). `Enclave::HttpTool` is an optional, batteries-included network tool that gets this right. Require it explicitly (it pulls in `net/http`):
+
+```ruby
+require "enclave/http_tool"
+
+http = Enclave::HttpTool.new(allow: %w[api.example.com *.githubusercontent.com])
+enclave.expose(http)
+
+enclave.eval(<<~RUBY)
+  resp = get("https://api.example.com/status")
+  resp["status"]  # 200
+  resp["body"]    # parsed Hash if the response was JSON, else the String
+RUBY
+```
+
+The sandbox gets `request(method, url, headers = {}, body = nil)` plus `get`/`post`/`put`/`patch`/`delete`/`head`. Only those verbs are exposed — the budgets, validators, and DNS handling stay private. Each request is checked, in order:
+
+1. **Budget** — request count and cumulative wall-clock across the tool's lifetime (the enclave timeout never counts host time).
+2. **URL** — http/https only, no `user:pass@` userinfo, no IP-literal hosts, a port allowlist (`[80, 443]` by default), CR/LF/NUL rejected.
+3. **Allowlist** — hostname label-suffix matching, so `*.example.com` matches `a.example.com` but never `example.com.evil.com`. Pass `allow: :any` to skip *only* the allowlist; the SSRF floor below still holds.
+4. **Headers** — `Host`/`Content-Length`/`Transfer-Encoding`/`Connection` blocked, token-charset names enforced, CR/LF rejected. `Authorization` is allowed — you set your own credentials.
+5. **DNS + IP** — the host is resolved once, every resolved address is rejected if it falls in a private/link-local/metadata range, and the connection is then **pinned to the vetted IP** so a rebinding resolver can't swap it after the check.
+6. **Response** — the body is capped while streaming (`max_response_bytes`); redirects are returned to the sandbox, never auto-followed.
+
+Denied requests raise `Enclave::HttpTool::DeniedError` (surfaced to the sandbox as an error). Tunable: `max_requests:`, `request_timeout:`, `total_time_budget:`, `max_response_bytes:`, `allowed_ports:`, and `on_request:` (a host-side callable for auditing/metering). Hash/Array bodies are JSON-encoded and JSON responses parsed host-side, since the sandbox build carries no JSON.
+
 ### Allowed types
 
 Values crossing the boundary must be one of:
