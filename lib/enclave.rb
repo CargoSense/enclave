@@ -17,26 +17,43 @@ class Enclave
   DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
   class << self
-    attr_accessor :timeout, :memory_limit, :max_output_bytes
+    attr_accessor :timeout, :memory_limit, :max_output_bytes, :max_tool_calls, :max_tool_seconds
   end
   self.max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
 
-  attr_reader :timeout, :memory_limit, :max_output_bytes
+  attr_reader :timeout, :memory_limit, :max_output_bytes, :max_tool_calls, :max_tool_seconds
+
+  # Hooks invoked around every tool call (H4). Callables (or nil):
+  #   before_tool_call.call(name_symbol, args_array)          — may raise to veto
+  #   after_tool_call.call(name_symbol, args_array, result)
+  # Use them to meter, log, or rate-limit without monkey-patching. The tool-call
+  # budget (max_tool_calls / max_tool_seconds) is enforced separately, in C.
+  attr_accessor :before_tool_call, :after_tool_call
 
   def initialize(tools: nil, timeout: self.class.timeout, memory_limit: self.class.memory_limit,
-                 max_output_bytes: self.class.max_output_bytes)
+                 max_output_bytes: self.class.max_output_bytes,
+                 max_tool_calls: self.class.max_tool_calls, max_tool_seconds: self.class.max_tool_seconds,
+                 before_tool_call: nil, after_tool_call: nil)
     @tool_context = Object.new
     @timeout = timeout
     @memory_limit = memory_limit
     @max_output_bytes = max_output_bytes
-    _init(@timeout, @memory_limit, @max_output_bytes)
+    @max_tool_calls = max_tool_calls
+    @max_tool_seconds = max_tool_seconds
+    @before_tool_call = before_tool_call
+    @after_tool_call = after_tool_call
+    _init(@timeout, @memory_limit, @max_output_bytes, @max_tool_calls, @max_tool_seconds)
     expose(tools) if tools
   end
 
   def self.open(tools: nil, timeout: self.timeout, memory_limit: self.memory_limit,
-                max_output_bytes: self.max_output_bytes)
+                max_output_bytes: self.max_output_bytes,
+                max_tool_calls: self.max_tool_calls, max_tool_seconds: self.max_tool_seconds,
+                before_tool_call: nil, after_tool_call: nil)
     sandbox = new(tools: tools, timeout: timeout, memory_limit: memory_limit,
-                  max_output_bytes: max_output_bytes)
+                  max_output_bytes: max_output_bytes,
+                  max_tool_calls: max_tool_calls, max_tool_seconds: max_tool_seconds,
+                  before_tool_call: before_tool_call, after_tool_call: after_tool_call)
     begin
       yield sandbox
     ensure
@@ -94,5 +111,17 @@ class Enclave
       end
     end
     self
+  end
+
+  private
+
+  # Invoked from the C tool trampoline for every tool call, so the before/after
+  # hooks wrap the actual dispatch. A raise in before_tool_call vetoes the call.
+  # Not registered as a sandbox function, so untrusted code cannot reach it.
+  def __dispatch_tool(name, args)
+    @before_tool_call&.call(name, args)
+    result = @tool_context.__send__(name, *args)
+    @after_tool_call&.call(name, args, result)
+    result
   end
 end

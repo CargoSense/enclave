@@ -230,10 +230,18 @@ struct sandbox_state {
     mem_tracker_t   mem_tracker;
     timeout_state_t timeout_state;
 
-    /* Dedicated timeout exception class (Enclave::TimeoutError < Exception),
-     * (re)created by sandbox_setup_mrb. Cached so the code-fetch hook can raise
-     * it without a class lookup on every fetch. */
+    /* Tool-call budget (per eval). The gem's timeout only counts mruby
+     * execution, never time spent inside host tool methods (DB, HTTP), so
+     * without this a sandbox could pin a worker with unbounded tool calls. */
+    int             max_tool_calls;    /* 0 = unlimited */
+    double          max_tool_seconds;  /* cumulative wall-clock; 0 = unlimited */
+    int             tool_calls;        /* used this eval (reset in limits_begin) */
+    double          tool_seconds_used; /* used this eval */
+
+    /* Dedicated exception classes (< Exception), (re)created by
+     * sandbox_setup_mrb. Cached so hooks/trampoline can raise without a lookup. */
     struct RClass  *timeout_err_class;
+    struct RClass  *tool_budget_err_class;
 };
 
 /* ------------------------------------------------------------------ */
@@ -497,6 +505,21 @@ sandbox_function_trampoline(mrb_state *mrb, mrb_value self)
         return mrb_nil_value();
     }
 
+    /* Per-eval tool-call budget. Checked BEFORE running the call, so an
+     * exhausted budget blocks further host work rather than merely reporting it
+     * after the fact. The wall-clock budget can overshoot by at most one call —
+     * host code can't be interrupted mid-call. This raises a distinct class,
+     * catchable by sandbox code, but the budget stays exhausted so any retry
+     * re-raises; a rescue/retry spin is in turn bounded by the (uncatchable)
+     * timeout. */
+    if (state->max_tool_calls > 0 && state->tool_calls >= state->max_tool_calls) {
+        mrb_raisef(mrb, state->tool_budget_err_class,
+                   "tool-call count budget exceeded (max %d)", state->max_tool_calls);
+    }
+    if (state->max_tool_seconds > 0 && state->tool_seconds_used >= state->max_tool_seconds) {
+        mrb_raise(mrb, state->tool_budget_err_class, "tool-call time budget exceeded");
+    }
+
     /* Get the method name from the call info */
     const char *method_name = mrb_sym_name(mrb, mrb->c->ci->mid);
 
@@ -525,9 +548,18 @@ sandbox_function_trampoline(mrb_state *mrb, mrb_value self)
         }
     }
 
+    /* Count the call and time the host round-trip toward the budget. */
+    state->tool_calls++;
+    struct timespec tc_start, tc_end;
+    clock_gettime(CLOCK_MONOTONIC, &tc_start);
+
     /* Call the CRuby callback */
     sandbox_callback_result_t cb_result = state->callback(
         method_name, sargs, (int)argc, state->callback_userdata);
+
+    clock_gettime(CLOCK_MONOTONIC, &tc_end);
+    state->tool_seconds_used += (double)(tc_end.tv_sec - tc_start.tv_sec) +
+                                (double)(tc_end.tv_nsec - tc_start.tv_nsec) / 1e9;
 
     /* Free the converted args */
     for (mrb_int i = 0; i < argc; i++) {
@@ -677,6 +709,11 @@ sandbox_setup_mrb(sandbox_state_t *state)
      * stays valid even if sandboxed code detaches the Enclave constant. */
     mrb_gc_register(state->mrb, mrb_obj_value(state->timeout_err_class));
 
+    /* Raised by the trampoline when a per-eval tool-call budget is exhausted. */
+    state->tool_budget_err_class = mrb_define_class_under(
+        state->mrb, enclave_mod, "ToolBudgetError", state->mrb->eException_class);
+    mrb_gc_register(state->mrb, mrb_obj_value(state->tool_budget_err_class));
+
     /* Override Kernel#print, define Kernel#puts, override Kernel#p */
     struct RClass *kernel = state->mrb->kernel_module;
     mrb_define_method(state->mrb, kernel, "print", sandbox_mrb_print, MRB_ARGS_ANY());
@@ -703,7 +740,8 @@ sandbox_setup_mrb(sandbox_state_t *state)
 /* ------------------------------------------------------------------ */
 
 sandbox_state_t *
-sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes)
+sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
+                  int max_tool_calls, double max_tool_seconds)
 {
     sandbox_state_t *state = calloc(1, sizeof(sandbox_state_t));
     if (!state) return NULL;
@@ -711,6 +749,8 @@ sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes)
     state->timeout_seconds = timeout;
     state->memory_limit = memory_limit;
     state->max_output_bytes = max_output_bytes;
+    state->max_tool_calls = max_tool_calls;
+    state->max_tool_seconds = max_tool_seconds;
 
     /* Activate tracker with limit=0 (unlimited) during init so all
      * allocations get the size header prepended. */
@@ -783,6 +823,9 @@ sandbox_limits_begin(sandbox_state_t *state)
     state->mem_tracker.limit = state->memory_limit;
     mem_tracker_t *prev = mem_tracker_activate(&state->mem_tracker);
 
+    state->tool_calls = 0;
+    state->tool_seconds_used = 0.0;
+
     state->timeout_state.expired = 0;
     state->timeout_state.check_counter = 0;
     state->timeout_state.last_raise_pc = NULL;
@@ -815,13 +858,22 @@ sandbox_limits_end(sandbox_state_t *state)
     state->mem_tracker.limit = 0;
 }
 
-/* Classify error from flags, not string matching. */
+/* Classify error from flags / exception class, not string matching. */
 static sandbox_error_kind_t
 sandbox_classify_error(sandbox_state_t *state)
 {
     if (state->timeout_state.expired) {
         return SANDBOX_ERROR_TIMEOUT;
-    } else if (state->mem_tracker.exceeded) {
+    }
+    /* The tool-call budget is catchable, so classify by the actual uncaught
+     * exception's class rather than a counter — a caught budget error followed
+     * by a different uncaught error must not be misreported as a budget hit. */
+    if (state->tool_budget_err_class && state->mrb->exc &&
+        mrb_obj_is_kind_of(state->mrb, mrb_obj_value(state->mrb->exc),
+                           state->tool_budget_err_class)) {
+        return SANDBOX_ERROR_TOOL_BUDGET;
+    }
+    if (state->mem_tracker.exceeded) {
         return SANDBOX_ERROR_MEMORY_LIMIT;
     }
     return SANDBOX_ERROR_RUNTIME;
@@ -933,6 +985,11 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
     /* Check for exception */
     if (state->mrb->exc) {
         mrb_value exc = mrb_obj_value(state->mrb->exc);
+
+        /* Classify BEFORE inspecting: mrb_funcall(inspect) clears mrb->exc, and
+         * the tool-budget classification reads the live exception's class. */
+        result.error_kind = sandbox_classify_error(state);
+
         mrb_value exc_str = mrb_funcall_argv(state->mrb, exc,
                               mrb_intern_lit(state->mrb, "inspect"), 0, NULL);
         if (mrb_string_p(exc_str)) {
@@ -941,8 +998,6 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
         else {
             result.error = strdup_safe("unknown error", 13);
         }
-
-        result.error_kind = sandbox_classify_error(state);
 
         state->mrb->exc = NULL;
         mrb_gc_arena_restore(state->mrb, state->arena_idx);

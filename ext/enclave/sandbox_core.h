@@ -19,7 +19,8 @@ typedef enum {
     SANDBOX_ERROR_NONE,
     SANDBOX_ERROR_RUNTIME,
     SANDBOX_ERROR_TIMEOUT,
-    SANDBOX_ERROR_MEMORY_LIMIT
+    SANDBOX_ERROR_MEMORY_LIMIT,
+    SANDBOX_ERROR_TOOL_BUDGET
 } sandbox_error_kind_t;
 
 /* Result from an eval */
@@ -87,7 +88,8 @@ int sandbox_state_define_function(sandbox_state_t *state, const char *name);
 /* Core API                                                            */
 /* ------------------------------------------------------------------ */
 
-sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes);
+sandbox_state_t *sandbox_state_new(double timeout, size_t memory_limit, size_t max_output_bytes,
+                                   int max_tool_calls, double max_tool_seconds);
 void             sandbox_state_free(sandbox_state_t *state);
 sandbox_result_t sandbox_state_eval(sandbox_state_t *state, const char *code);
 void             sandbox_state_reset(sandbox_state_t *state);

@@ -12,6 +12,10 @@
 static VALUE cEnclaveError;
 static VALUE cEnclaveTimeoutError;
 static VALUE cEnclaveMemoryLimitError;
+static VALUE cEnclaveToolBudgetError;
+
+/* Cached method id for the Ruby-side tool dispatcher */
+static ID id_dispatch_tool;
 
 /* ------------------------------------------------------------------ */
 /* sandbox_value_t <-> CRuby VALUE conversion                          */
@@ -156,17 +160,19 @@ rb_to_sandbox_value(VALUE v, sandbox_value_t *out, char *errbuf, size_t errbuf_s
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    VALUE tool_context;  /* @tool_context object */
+    VALUE self;          /* the Enclave instance */
     VALUE method_name;   /* Symbol for the method */
-    int   argc;
-    VALUE *argv;
+    VALUE args_ary;      /* Array of converted args */
 } cruby_call_args_t;
 
 static VALUE
 cruby_protected_call(VALUE arg)
 {
     cruby_call_args_t *ca = (cruby_call_args_t *)arg;
-    return rb_funcallv(ca->tool_context, SYM2ID(ca->method_name), ca->argc, ca->argv);
+    /* Route through the Ruby-side dispatcher so before/after_tool_call hooks run
+     * around the actual send. The tool-call budget is enforced in the C
+     * trampoline (before this callback fires), not here. */
+    return rb_funcall(ca->self, id_dispatch_tool, 2, ca->method_name, ca->args_ary);
 }
 
 static sandbox_callback_result_t
@@ -180,24 +186,18 @@ sandbox_cruby_callback(const char *method_name,
 
     VALUE self = (VALUE)userdata;
 
-    /* Convert sandbox args -> CRuby VALUEs */
-    VALUE *rb_args = NULL;
-    if (argc > 0) {
-        rb_args = ALLOCA_N(VALUE, argc);
-        for (int i = 0; i < argc; i++) {
-            rb_args[i] = sandbox_value_to_rb(&args[i]);
-        }
+    /* Convert sandbox args -> a CRuby Array for the dispatcher */
+    VALUE args_ary = rb_ary_new_capa(argc);
+    for (int i = 0; i < argc; i++) {
+        rb_ary_push(args_ary, sandbox_value_to_rb(&args[i]));
     }
 
-    /* Call @tool_context.send(method_name, *args) via rb_protect */
-    VALUE tool_context = rb_ivar_get(self, rb_intern("@tool_context"));
     VALUE method_sym = ID2SYM(rb_intern(method_name));
 
     cruby_call_args_t ca;
-    ca.tool_context = tool_context;
+    ca.self = self;
     ca.method_name = method_sym;
-    ca.argc = argc;
-    ca.argv = rb_args;
+    ca.args_ary = args_ary;
 
     int state = 0;
     VALUE ret = rb_protect(cruby_protected_call, (VALUE)&ca, &state);
@@ -281,7 +281,8 @@ enclave_alloc(VALUE klass)
 }
 
 static VALUE
-enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb_max_output_bytes)
+enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb_max_output_bytes,
+                   VALUE rb_max_tool_calls, VALUE rb_max_tool_seconds)
 {
     rb_enclave_t *sb;
     TypedData_Get_Struct(self, rb_enclave_t, &enclave_data_type, sb);
@@ -289,8 +290,11 @@ enclave_initialize(VALUE self, VALUE rb_timeout, VALUE rb_memory_limit, VALUE rb
     double timeout = NIL_P(rb_timeout) ? 0.0 : NUM2DBL(rb_timeout);
     size_t memory_limit = NIL_P(rb_memory_limit) ? 0 : (size_t)NUM2ULL(rb_memory_limit);
     size_t max_output_bytes = NIL_P(rb_max_output_bytes) ? 0 : (size_t)NUM2ULL(rb_max_output_bytes);
+    int max_tool_calls = NIL_P(rb_max_tool_calls) ? 0 : NUM2INT(rb_max_tool_calls);
+    double max_tool_seconds = NIL_P(rb_max_tool_seconds) ? 0.0 : NUM2DBL(rb_max_tool_seconds);
 
-    sb->state = sandbox_state_new(timeout, memory_limit, max_output_bytes);
+    sb->state = sandbox_state_new(timeout, memory_limit, max_output_bytes,
+                                  max_tool_calls, max_tool_seconds);
     if (!sb->state) {
         rb_raise(rb_eRuntimeError, "failed to initialize mruby enclave");
     }
@@ -343,6 +347,12 @@ enclave_eval(VALUE self, VALUE rb_code)
         VALUE exc_msg = rb_str_new_cstr(msg);
         sandbox_result_free(&result);
         rb_exc_raise(rb_exc_new_str(cEnclaveMemoryLimitError, exc_msg));
+    }
+    if (result.error_kind == SANDBOX_ERROR_TOOL_BUDGET) {
+        const char *msg = result.error ? result.error : "tool-call budget exceeded";
+        VALUE exc_msg = rb_str_new_cstr(msg);
+        sandbox_result_free(&result);
+        rb_exc_raise(rb_exc_new_str(cEnclaveToolBudgetError, exc_msg));
     }
 
     VALUE value = result.value ? rb_str_new_cstr(result.value) : Qnil;
@@ -407,13 +417,17 @@ Init_enclave(void)
     cEnclaveError = rb_define_class_under(cEnclave, "Error", rb_eStandardError);
     cEnclaveTimeoutError = rb_define_class_under(cEnclave, "TimeoutError", cEnclaveError);
     cEnclaveMemoryLimitError = rb_define_class_under(cEnclave, "MemoryLimitError", cEnclaveError);
+    cEnclaveToolBudgetError = rb_define_class_under(cEnclave, "ToolBudgetError", cEnclaveError);
 
     rb_gc_register_mark_object(cEnclaveError);
     rb_gc_register_mark_object(cEnclaveTimeoutError);
     rb_gc_register_mark_object(cEnclaveMemoryLimitError);
+    rb_gc_register_mark_object(cEnclaveToolBudgetError);
+
+    id_dispatch_tool = rb_intern("__dispatch_tool");
 
     rb_define_alloc_func(cEnclave, enclave_alloc);
-    rb_define_method(cEnclave, "_init",            enclave_initialize,      3);
+    rb_define_method(cEnclave, "_init",            enclave_initialize,      5);
     rb_define_method(cEnclave, "_eval",            enclave_eval,            1);
     rb_define_method(cEnclave, "_define_function", enclave_define_function, 1);
     rb_define_method(cEnclave, "reset!",           enclave_reset,           0);

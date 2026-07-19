@@ -230,6 +230,9 @@ enclave = Enclave.new(tools: tools, timeout: 5, memory_limit: 10_000_000)
 |--------|-------------|---------|
 | `timeout:` | Max seconds of mruby execution | `nil` (unlimited) |
 | `memory_limit:` | Max bytes of mruby heap | `nil` (unlimited) |
+| `max_output_bytes:` | Max bytes of captured `puts`/`print`/`p` output | `10 * 1024 * 1024` |
+| `max_tool_calls:` | Max tool calls per `eval` | `nil` (unlimited) |
+| `max_tool_seconds:` | Max cumulative wall-clock spent in tool calls per `eval` | `nil` (unlimited) |
 
 When a limit is hit, the enclave raises instead of returning a Result:
 
@@ -239,9 +242,15 @@ enclave.eval("loop {}")
 
 enclave.eval('"x" * 10_000_000')
 #=> Enclave::MemoryLimitError: NoMemoryError
+
+# with max_tool_calls: 50
+enclave.eval("1000.times { some_tool }")
+#=> Enclave::ToolBudgetError: tool-call count budget exceeded (max 50)
 ```
 
-Both inherit from `Enclave::Error < StandardError`, so you can rescue them together:
+`max_output_bytes` is the exception: rather than raise, it truncates the captured output (with a marker) so the code still runs. It defaults to a non-nil cap because the output buffer is host memory that `memory_limit` does not count — set it to `nil` for unlimited.
+
+The raising limits inherit from `Enclave::Error < StandardError`, so you can rescue them together:
 
 ```ruby
 begin
@@ -267,7 +276,21 @@ Per-instance values override the defaults. `nil` means unlimited.
 
 ### What counts toward limits
 
-Only mruby execution counts. When the sandbox calls one of your tool methods, that Ruby code runs in CRuby and is not subject to the timeout or memory limit. This is intentional: limits protect the host from the sandbox, not from your own code.
+`timeout` and `memory_limit` cover only mruby execution. When the sandbox calls one of your tool methods, that Ruby code runs in CRuby and is **not** subject to them — so a sandbox that makes many (or slow) tool calls could still tie up a worker. `max_tool_calls` and `max_tool_seconds` bound exactly that: the number of tool calls and the cumulative wall-clock spent in them, per `eval`. The time budget can overshoot by at most one call, since a tool method already running can't be interrupted.
+
+### Tool-call hooks
+
+Pass callables to run around every tool call — for metering, logging, or rate limiting — without wrapping your tool object:
+
+```ruby
+enclave = Enclave.new(
+  tools: tools,
+  before_tool_call: ->(name, args) { StatsD.increment("tool.#{name}") },
+  after_tool_call:  ->(name, args, result) { logger.debug("#{name} -> #{result.class}") },
+)
+```
+
+`before_tool_call` runs before the method; raising in it **vetoes** the call (useful for rate limiting). `after_tool_call` runs after, with the return value. Both can also be assigned after construction (`enclave.before_tool_call = ...`).
 
 ## Safety
 

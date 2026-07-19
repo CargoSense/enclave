@@ -917,6 +917,101 @@ RSpec.describe Enclave do
     end
   end
 
+  # H4: the timeout counts only mruby execution, never time inside host tool
+  # methods, so a sandbox could pin a worker with unbounded tool calls. Provide a
+  # per-eval budget (count + cumulative wall-clock) plus before/after hooks.
+  describe "tool-call budget and hooks (H4)" do
+    # Tool object whose calls we observe through a closure, so no extra methods
+    # leak into the sandbox. `slow` sleeps to exercise the wall-clock budget.
+    def build_tool(calls)
+      tool = Object.new
+      tool.define_singleton_method(:touch) { |*a| calls << a; "ok" }
+      tool.define_singleton_method(:slow)  { |*_a| calls << :slow; sleep 0.1; "s" }
+      tool
+    end
+
+    it "caps the number of tool calls per eval" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), max_tool_calls: 3, timeout: 5)
+      expect { e.eval("10.times { touch }") }.to raise_error(Enclave::ToolBudgetError)
+      expect(calls.size).to eq(3)
+      e.close
+    end
+
+    it "resets the call budget each eval" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), max_tool_calls: 2, timeout: 5)
+      2.times { e.eval("5.times { touch }") rescue nil }
+      expect(calls.size).to eq(4)
+      e.close
+    end
+
+    it "is unlimited by default" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), timeout: 5)
+      e.eval("20.times { touch }")
+      expect(calls.size).to eq(20)
+      e.close
+    end
+
+    it "bounds cumulative tool wall-clock with max_tool_seconds" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), max_tool_seconds: 0.25, timeout: 30)
+      expect { e.eval("100.times { slow }") }.to raise_error(Enclave::ToolBudgetError)
+      expect(calls.size).to be_between(1, 6) # a few 0.1s calls, nowhere near 100
+      e.close
+    end
+
+    it "ToolBudgetError is an Enclave::Error" do
+      expect(Enclave::ToolBudgetError).to be < Enclave::Error
+    end
+
+    it "runs before_tool_call with (name, args)" do
+      seen = []
+      e = described_class.new(tools: build_tool([]), timeout: 5,
+                              before_tool_call: ->(name, args) { seen << [name, args] })
+      e.eval("touch(1, 2)")
+      expect(seen).to eq([[:touch, [1, 2]]])
+      e.close
+    end
+
+    it "runs after_tool_call with (name, args, result)" do
+      seen = []
+      e = described_class.new(tools: build_tool([]), timeout: 5,
+                              after_tool_call: ->(name, args, result) { seen << [name, args, result] })
+      e.eval("touch(7)")
+      expect(seen).to eq([[:touch, [7], "ok"]])
+      e.close
+    end
+
+    it "lets before_tool_call veto a call by raising" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), timeout: 5,
+                              before_tool_call: ->(_name, _args) { raise "denied" })
+      result = e.eval("touch")
+      expect(calls).to be_empty
+      expect(result.error?).to be true
+      expect(result.error).to include("denied")
+      e.close
+    end
+
+    it "works with no hooks set (default)" do
+      calls = []
+      e = described_class.new(tools: build_tool(calls), timeout: 5)
+      result = e.eval("touch")
+      expect(result.error?).to be false
+      expect(calls.size).to eq(1)
+      e.close
+    end
+
+    it "exposes the budget via attr_readers" do
+      e = described_class.new(max_tool_calls: 9, max_tool_seconds: 1.5)
+      expect(e.max_tool_calls).to eq(9)
+      expect(e.max_tool_seconds).to eq(1.5)
+      e.close
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError
