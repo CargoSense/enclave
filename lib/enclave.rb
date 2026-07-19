@@ -134,11 +134,21 @@ class Enclave
   # Names in only:/except: that aren't exposable public methods raise
   # ArgumentError, so a typo can't silently widen (except:) or misname (only:)
   # the surface.
+  #
+  # An object may also declare its own surface by defining `enclave_tool_methods`
+  # (public or private) returning the method names it intends to expose. That
+  # declaration is a hard CEILING: nothing outside it can ever reach the sandbox,
+  # even under an explicit except:. This lets a tool keep host-management methods
+  # public and callable while keeping them out of the sandbox (e.g. HttpTool
+  # exposes only its HTTP verbs but leaves reset_budget! public for the host).
   def expose(obj, only: nil, except: nil)
     raise ArgumentError, "expose: pass only: or except:, not both" if only && except
 
     is_module = obj.is_a?(Module)
     candidates = (is_module ? obj.instance_methods(false) : obj.public_methods(false)).map(&:to_sym)
+    if obj.respond_to?(:enclave_tool_methods, true)
+      candidates &= Array(obj.send(:enclave_tool_methods)).map(&:to_sym)
+    end
     names = filter_exposed(candidates, only: only, except: except)
 
     @tool_context.extend(obj) if is_module
