@@ -30,10 +30,20 @@ class Enclave
   # budget (max_tool_calls / max_tool_seconds) is enforced separately, in C.
   attr_accessor :before_tool_call, :after_tool_call
 
+  # Optional error sanitizer (H6). When a tool method raises, its message
+  # (exc.inspect) otherwise crosses back into the sandbox verbatim — leaking host
+  # internals (SQL, file paths, IDs, third-party error bodies) to untrusted code.
+  # Set a callable to map the exception to a safe message the sandbox may see,
+  # e.g. ->(name, exc) { logger.error(exc.full_message); "#{name} failed" }.
+  # nil (default) passes the original message through. Only tool-method
+  # exceptions are sanitized — before/after_tool_call raises pass through, since
+  # those messages are yours.
+  attr_accessor :error_sanitizer
+
   def initialize(tools: nil, timeout: self.class.timeout, memory_limit: self.class.memory_limit,
                  max_output_bytes: self.class.max_output_bytes,
                  max_tool_calls: self.class.max_tool_calls, max_tool_seconds: self.class.max_tool_seconds,
-                 before_tool_call: nil, after_tool_call: nil)
+                 before_tool_call: nil, after_tool_call: nil, error_sanitizer: nil)
     @tool_context = Object.new
     @timeout = timeout
     @memory_limit = memory_limit
@@ -42,6 +52,7 @@ class Enclave
     @max_tool_seconds = max_tool_seconds
     @before_tool_call = before_tool_call
     @after_tool_call = after_tool_call
+    @error_sanitizer = error_sanitizer
     @exposed_functions = []
     _init(@timeout, @memory_limit, @max_output_bytes, @max_tool_calls, @max_tool_seconds)
     expose(tools) if tools
@@ -50,11 +61,12 @@ class Enclave
   def self.open(tools: nil, timeout: self.timeout, memory_limit: self.memory_limit,
                 max_output_bytes: self.max_output_bytes,
                 max_tool_calls: self.max_tool_calls, max_tool_seconds: self.max_tool_seconds,
-                before_tool_call: nil, after_tool_call: nil)
+                before_tool_call: nil, after_tool_call: nil, error_sanitizer: nil)
     sandbox = new(tools: tools, timeout: timeout, memory_limit: memory_limit,
                   max_output_bytes: max_output_bytes,
                   max_tool_calls: max_tool_calls, max_tool_seconds: max_tool_seconds,
-                  before_tool_call: before_tool_call, after_tool_call: after_tool_call)
+                  before_tool_call: before_tool_call, after_tool_call: after_tool_call,
+                  error_sanitizer: error_sanitizer)
     begin
       yield sandbox
     ensure
@@ -161,8 +173,30 @@ class Enclave
   # Not registered as a sandbox function, so untrusted code cannot reach it.
   def __dispatch_tool(name, args)
     @before_tool_call&.call(name, args)
-    result = @tool_context.__send__(name, *args)
+    result =
+      begin
+        @tool_context.__send__(name, *args)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        # Sanitize only the tool method's own error before it crosses back.
+        raise sanitized_tool_error(name, e)
+      end
     @after_tool_call&.call(name, args, result)
     result
+  end
+
+  # Map a tool exception to what the sandbox is allowed to see. With no
+  # sanitizer, the original exception passes through unchanged (default). A
+  # sanitizer that itself raises must never leak the original, so it falls back
+  # to a generic message.
+  def sanitized_tool_error(name, exc)
+    return exc if @error_sanitizer.nil?
+
+    message =
+      begin
+        @error_sanitizer.call(name, exc)
+      rescue Exception # rubocop:disable Lint/RescueException
+        nil
+      end
+    RuntimeError.new(message.nil? ? "tool call failed" : message.to_s)
   end
 end

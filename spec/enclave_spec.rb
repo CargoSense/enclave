@@ -1098,6 +1098,81 @@ RSpec.describe Enclave do
     end
   end
 
+  # H6: a tool method's exception message crosses back into the sandbox verbatim,
+  # leaking host internals. Provide an optional sanitizer to redact it.
+  describe "tool-error sanitization (H6)" do
+    secret = "SELECT * FROM users WHERE ssn='123-45-6789'"
+
+    let(:tools) do
+      s = secret
+      Class.new do
+        define_method(:boom) { raise ArgumentError, s }
+        def ok; "fine"; end
+      end.new
+    end
+
+    # Read the message the sandbox sees for a failing tool call.
+    def sandboxed_message(enclave)
+      enclave.eval("begin; boom; rescue => ex; ex.message; end").value
+    end
+
+    it "leaks the full message by default (no sanitizer)" do
+      e = described_class.new(tools: tools, timeout: 5)
+      expect(sandboxed_message(e)).to include("ssn=")
+      e.close
+    end
+
+    it "redacts the message when a sanitizer is set" do
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(name, _exc) { "#{name} failed" })
+      msg = sandboxed_message(e)
+      expect(msg).not_to include("ssn=")
+      expect(msg).to include("boom failed")
+      e.close
+    end
+
+    it "passes the tool name and original exception to the sanitizer" do
+      seen = nil
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(name, exc) { seen = [name, exc.class, exc.message]; "x" })
+      sandboxed_message(e)
+      expect(seen[0]).to eq(:boom)
+      expect(seen[1]).to eq(ArgumentError)
+      expect(seen[2]).to include("ssn=") # host still gets the full error to log
+      e.close
+    end
+
+    it "does not touch successful tool calls" do
+      e = described_class.new(tools: tools, timeout: 5, error_sanitizer: ->(_n, _e) { "x" })
+      expect(e.eval("ok").value).to eq('"fine"')
+      e.close
+    end
+
+    it "does not sanitize a before_tool_call veto (integrator-owned message)" do
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(_n, _e) { "redacted" },
+                              before_tool_call: ->(_n, _a) { raise "rate limited" })
+      msg = e.eval("begin; ok; rescue => ex; ex.message; end").value
+      expect(msg).to include("rate limited")
+      e.close
+    end
+
+    it "falls back to a generic message if the sanitizer itself raises" do
+      e = described_class.new(tools: tools, timeout: 5,
+                              error_sanitizer: ->(_n, _e) { raise "bug: #{secret}" })
+      msg = sandboxed_message(e)
+      expect(msg).not_to include("ssn=")
+      expect(msg).to include("tool call failed")
+      e.close
+    end
+
+    it "falls back to a generic message if the sanitizer returns nil" do
+      e = described_class.new(tools: tools, timeout: 5, error_sanitizer: ->(_n, _e) { nil })
+      expect(sandboxed_message(e)).to include("tool call failed")
+      e.close
+    end
+  end
+
   describe "error classes" do
     it "Enclave::Error inherits from StandardError" do
       expect(Enclave::Error).to be < StandardError

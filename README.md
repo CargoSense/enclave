@@ -309,6 +309,22 @@ enclave = Enclave.new(
 
 `before_tool_call` runs before the method; raising in it **vetoes** the call (useful for rate limiting). `after_tool_call` runs after, with the return value. Both can also be assigned after construction (`enclave.before_tool_call = ...`).
 
+### Sanitizing tool errors
+
+When a tool method raises, its message crosses back into the sandbox verbatim — which can leak host internals (SQL fragments, file paths, IDs, third-party error bodies) to the code author. Pass an `error_sanitizer` to control what the sandbox sees, while you keep the full error host-side:
+
+```ruby
+enclave = Enclave.new(
+  tools: tools,
+  error_sanitizer: ->(name, exc) {
+    Rails.logger.error("tool #{name} failed: #{exc.full_message}")
+    "#{name} failed"           # message the sandbox sees; or exc.class.to_s for class-only
+  },
+)
+```
+
+Only the tool method's own exception is sanitized — a `before_tool_call` veto passes through, since that message is yours. If the sanitizer itself raises or returns `nil`, the sandbox gets a generic `"tool call failed"` and nothing leaks. This matters most once behaviors are authored by a less-trusted party (e.g. an LLM); for a trusted developer the default pass-through is fine for debugging.
+
 ## Safety
 
 If you run LLM-generated code with `eval` in CRuby, it can do anything your app can do. Here's what happens when you try those same things inside the enclave:
