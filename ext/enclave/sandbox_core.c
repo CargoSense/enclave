@@ -1014,6 +1014,7 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
     }
 
     /* Execute */
+    unsigned int prev_keep = state->stack_keep;
     mrb_value mrb_result = mrb_vm_run(state->mrb, proc,
                                        mrb_top_self(state->mrb),
                                        state->stack_keep);
@@ -1043,6 +1044,28 @@ sandbox_state_eval(sandbox_state_t *state, const char *code)
 
         state->mrb->exc = NULL;
         mrb_gc_arena_restore(state->mrb, state->arena_idx);
+
+        /* A memory-limit abort would otherwise wedge the enclave for good:
+         * the aborted eval's allocations stay on the heap with the tracker at
+         * the cap, so the NEXT eval's allocations (including the parser's,
+         * which don't GC-and-retry) fail before mruby's GC ever runs. Locals
+         * persist across evals here, so the aborted eval's own locals pin
+         * that memory — roll persistence back to the pre-eval extent, drop
+         * the aborted slots, and collect (limit already disarmed by
+         * limits_end, tracker still active so the frees are tracked).
+         * Instance variables the aborted eval already set do persist — only
+         * its locals are sacrificed to reclaim the memory. */
+        if (state->mem_tracker.exceeded) {
+            unsigned int keep = prev_keep > 0 ? prev_keep : 1; /* slot 0: self */
+            mrb_value *st = state->mrb->c->ci->stack;
+            if (st) {
+                for (unsigned int i = keep; i < proc->body.irep->nlocals; i++) {
+                    st[i] = mrb_nil_value();
+                }
+            }
+            state->stack_keep = prev_keep;
+            mrb_full_gc(state->mrb);
+        }
         state->cxt->lineno++;
         mem_tracker_restore(prev);
         return result;

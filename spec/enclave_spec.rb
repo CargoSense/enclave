@@ -752,6 +752,21 @@ RSpec.describe Enclave do
       e.close
     end
 
+    it "enclave is usable after a CUMULATIVE memory-limit abort" do
+      # Regression: unlike a single failed allocation, a cumulative abort leaves
+      # the dead eval's garbage retained on the heap with the tracker at the
+      # cap. Without the post-abort GC the next eval's parser allocations fail
+      # ("parser allocation failed") and the enclave is wedged for good.
+      e = described_class.new(memory_limit: 5_000_000, timeout: 10)
+      expect {
+        e.eval('a = []; 500_000.times { a << ("x" * 1000) }; a.length')
+      }.to raise_error(Enclave::MemoryLimitError)
+      result = e.eval("1 + 1")
+      expect(result.error).to be_nil
+      expect(result.value).to eq("2")
+      e.close
+    end
+
     it "applies class-level default" do
       begin
         Enclave.memory_limit = 1_000_000
