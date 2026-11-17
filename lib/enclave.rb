@@ -187,11 +187,20 @@ class Enclave
   # Invoked from the C tool trampoline for every tool call, so the before/after
   # hooks wrap the actual dispatch. A raise in before_tool_call vetoes the call.
   # Not registered as a sandbox function, so untrusted code cannot reach it.
+  #
+  # Only a name in @exposed_functions is ever run, and only as a public method
+  # of @tool_context. The C trampoline now supplies a fixed, registration-time
+  # name, but this check is the host-side allowlist and must not depend on
+  # that: a name that is not exposed is refused before any hook runs, and a
+  # private or inherited method can never be reached through a tool call.
   def __dispatch_tool(name, args)
+    name = name.to_sym
+    raise NoMethodError, "undefined tool '#{name}'" unless @exposed_functions.include?(name)
+
     @before_tool_call&.call(name, args)
     result =
       begin
-        @tool_context.__send__(name, *args)
+        @tool_context.public_send(name, *args)
       rescue Exception => e # rubocop:disable Lint/RescueException
         # Sanitize only the tool method's own error before it crosses back.
         raise sanitized_tool_error(name, e)

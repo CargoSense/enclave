@@ -518,6 +518,52 @@ get_sandbox_state(mrb_state *mrb)
     return (sandbox_state_t *)mrb->ud;
 }
 
+/* Fixed tool identity.
+ *
+ * Every tool method is the same C trampoline, so the trampoline must learn
+ * WHICH tool it is from somewhere. It used to read the call-site method symbol
+ * (mrb->c->ci->mid). That is sandbox-controlled: `alias_method :x, :tool`
+ * rebinds the trampoline under a name of the sandbox's choosing, and mruby's
+ * small-symbol name buffer (mrb->symbuf) is shared, so converting a short
+ * symbol argument could overwrite a short tool name in place. Either way the
+ * host was handed a name it never registered, or the wrong registered name.
+ *
+ * Instead each registration gets its own cfunc proc whose private env holds
+ * the index of the registered name. The env is set by the host at define
+ * time and is not reachable from sandbox code (cfunc procs expose no binding),
+ * so the name the host receives is always one it registered, exactly the one
+ * bound to the method that was invoked, however the sandbox spelled the call. */
+static const char *
+sandbox_tool_name(mrb_state *mrb, sandbox_state_t *state)
+{
+    mrb_value ident = mrb_proc_cfunc_env_get(mrb, 0);
+    if (!mrb_integer_p(ident)) {
+        mrb_raise(mrb, mrb_class_get(mrb, "RuntimeError"), "tool identity missing");
+    }
+    mrb_int idx = mrb_integer(ident);
+    if (idx < 0 || idx >= state->func_count || !state->func_names[idx]) {
+        mrb_raise(mrb, mrb_class_get(mrb, "RuntimeError"), "tool identity out of range");
+    }
+    return state->func_names[idx];
+}
+
+static mrb_value sandbox_function_trampoline(mrb_state *mrb, mrb_value self);
+
+/* Define Kernel#<func_names[idx]> as the trampoline with idx bound in its env. */
+static void
+sandbox_define_tool(sandbox_state_t *state, int idx)
+{
+    mrb_state *mrb = state->mrb;
+    int ai = mrb_gc_arena_save(mrb);
+    mrb_value env = mrb_fixnum_value(idx);
+    struct RProc *proc = mrb_proc_new_cfunc_with_env(mrb, sandbox_function_trampoline, 1, &env);
+    mrb_method_t m;
+    MRB_METHOD_FROM_PROC(m, proc);
+    mrb_define_method_raw(mrb, mrb->kernel_module,
+                          mrb_intern_cstr(mrb, state->func_names[idx]), m);
+    mrb_gc_arena_restore(mrb, ai);
+}
+
 static mrb_value
 sandbox_function_trampoline(mrb_state *mrb, mrb_value self)
 {
@@ -542,8 +588,10 @@ sandbox_function_trampoline(mrb_state *mrb, mrb_value self)
         mrb_raise(mrb, state->tool_budget_err_class, "tool-call time budget exceeded");
     }
 
-    /* Get the method name from the call info */
-    const char *method_name = mrb_sym_name(mrb, mrb->c->ci->mid);
+    /* The tool's fixed identity, captured at registration (see
+     * sandbox_define_tool). Resolved before any other mruby work in this call
+     * so nothing can disturb it. */
+    const char *method_name = sandbox_tool_name(mrb, state);
 
     /* Get args */
     mrb_int argc;
@@ -613,10 +661,8 @@ sandbox_function_trampoline(mrb_state *mrb, mrb_value self)
 static void
 register_functions_in_mrb(sandbox_state_t *state)
 {
-    struct RClass *kernel = state->mrb->kernel_module;
     for (int i = 0; i < state->func_count; i++) {
-        mrb_define_method(state->mrb, kernel, state->func_names[i],
-                          sandbox_function_trampoline, MRB_ARGS_ANY());
+        sandbox_define_tool(state, i);
     }
 }
 
@@ -1172,12 +1218,11 @@ sandbox_state_define_function(sandbox_state_t *state, const char *name)
 
     char *copy = strdup(name);
     if (!copy) return -1;
-    state->func_names[state->func_count++] = copy;
+    state->func_names[state->func_count] = copy;
 
-    /* Register in the current mruby state */
-    struct RClass *kernel = state->mrb->kernel_module;
-    mrb_define_method(state->mrb, kernel, name,
-                      sandbox_function_trampoline, MRB_ARGS_ANY());
+    /* Register in the current mruby state, bound to its index. */
+    sandbox_define_tool(state, state->func_count);
+    state->func_count++;
     return 0;
 }
 
