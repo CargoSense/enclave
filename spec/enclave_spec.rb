@@ -305,6 +305,112 @@ RSpec.describe Enclave do
     end
   end
 
+  describe "tool identity is fixed at registration" do
+    # The host must only ever be asked to run a tool under the name it was
+    # exposed as, whatever name sandbox code used to call it, and never a name
+    # that was not exposed at all (Paraxial.io finding, 2026-11-16).
+    module IdentityTools
+      def json_parse(s)
+        "parsed:#{s}"
+      end
+
+      def secret
+        "secret"
+      end
+
+      def get(x)
+        "get:#{x.inspect}"
+      end
+
+      def ab(*)
+        "ab"
+      end
+    end
+
+    class IdentityObject
+      def visible
+        "visible"
+      end
+
+      private
+
+      def hidden
+        "hidden"
+      end
+    end
+
+    let(:seen) { [] }
+    let(:e) { described_class.new(tools: IdentityTools, before_tool_call: ->(name, _args) { seen << name }) }
+
+    after { e.close }
+
+    it "runs the original tool under its registered name when the sandbox rebinds it" do
+      result = e.eval(<<~RUBY)
+        module Kernel; alias_method :"`", :json_parse; end
+        send(:"`", "x")
+      RUBY
+      expect(result.error).to be_nil
+      expect(result.value).to eq('"parsed:x"')
+      expect(seen).to eq([:json_parse])
+    end
+
+    it "reports the registered name for every rebinding route" do
+      [
+        "alias run_me json_parse; run_me('x')",
+        "module Kernel; alias_method :system, :json_parse; end; system('x')",
+        "module Kernel; alias_method :caller, :json_parse; end; caller('x')",
+        "singleton_class.send(:alias_method, :exec, :json_parse); exec('x')",
+        "class Foo; alias_method :spawn, :json_parse; end; Foo.new.spawn('x')",
+        "method(:json_parse).call('x')",
+        "Kernel.instance_method(:json_parse).bind(Object.new).call('x')",
+      ].each do |code|
+        seen.clear
+        result = e.eval(code)
+        expect(result.error).to be_nil, "#{code}: #{result.error}"
+        expect(seen).to eq([:json_parse]), code
+      end
+    end
+
+    it "carries the identity with the method, not the name" do
+      result = e.eval("module Kernel; alias_method :json_parse, :secret; end; json_parse")
+      expect(result.value).to eq('"secret"')
+      expect(seen).to eq([:secret])
+    end
+
+    it "is not confused by short symbol arguments sharing mruby's symbol buffer" do
+      ["get(:ab)", "get({:ab => 1})", "get([:ab, :cd])"].each do |code|
+        result = e.eval(code)
+        expect(result.error).to be_nil, "#{code}: #{result.error}"
+        expect(result.value).to start_with('"get:'), "#{code}: #{result.value}"
+      end
+      expect(seen).to all(eq(:get))
+    end
+
+    it "survives reset!" do
+      e.reset!
+      result = e.eval("alias zz json_parse; zz('x')")
+      expect(result.value).to eq('"parsed:x"')
+      expect(seen).to eq([:json_parse])
+    end
+
+    it "refuses to dispatch a name that was not exposed, before any hook runs" do
+      # Host-side allowlist, independent of the C trampoline.
+      expect { e.send(:__dispatch_tool, :system, ["id"]) }.to raise_error(NoMethodError, /undefined tool 'system'/)
+      expect { e.send(:__dispatch_tool, :object_id, []) }.to raise_error(NoMethodError, /undefined tool/)
+      expect { e.send(:__dispatch_tool, "puts", []) }.to raise_error(NoMethodError, /undefined tool/)
+      expect(seen).to be_empty
+    end
+
+    it "never reaches a private method of the tool object" do
+      obj = described_class.new(tools: IdentityObject.new)
+      expect(obj.exposed_functions).to eq([:visible])
+      expect { obj.send(:__dispatch_tool, :hidden, []) }.to raise_error(NoMethodError, /undefined tool 'hidden'/)
+      expect(obj.eval("hidden").error?).to be true
+      expect(obj.eval("visible").value).to eq('"visible"')
+      obj.close
+    end
+  end
+
   describe "#reset!" do
     it "clears local variables" do
       enclave.eval("x = 42")
